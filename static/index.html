@@ -111,6 +111,16 @@ function fmtNum(n, decimals) {
   return Number(n).toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 }
 
+function fmtUsd(n) {
+  if (n === null || n === undefined) return null;
+  return '$' + Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function fmtPct(n, decimals) {
+  if (n === null || n === undefined) return '—';
+  return Number(n).toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals }) + '%';
+}
+
 function feeTierLabel(feeRaw) {
   return (feeRaw / 10000).toFixed(2) + '%';
 }
@@ -136,6 +146,14 @@ function renderPositions(positions) {
       ? `${fmtNum(p.amount0, 6)} ${sym0} + ${fmtNum(p.amount1, 6)} ${sym1}`
       : `<span class="stat-value dim">unavailable</span>`;
 
+    const usdValue = fmtUsd(p.position_value_usd);
+    const usdLine = usdValue
+      ? `<div class="stat-value" style="margin-top:2px;">${usdValue}</div>`
+      : '';
+
+    const aprLine = fmtPct(p.lifetime_apr_pct, 1);
+    const feesUsd = fmtUsd(p.cumulative_fees_usd);
+
     return `
       <div class="position-card ${rangeClass}">
         <div class="pos-header">
@@ -151,20 +169,26 @@ function renderPositions(positions) {
           <div>
             <div class="stat-label">Current Holdings</div>
             <div class="stat-value">${holdingsLine}</div>
+            ${usdLine}
           </div>
           <div>
-            <div class="stat-label">Tick Range</div>
-            <div class="stat-value dim">[${p.tick_lower}, ${p.tick_upper}]</div>
+            <div class="stat-label">Range Width</div>
+            <div class="stat-value">${fmtPct(p.range_width_pct, 1)}</div>
+            <div class="stat-value dim" style="margin-top:2px;">[${p.tick_lower}, ${p.tick_upper}]</div>
           </div>
           <div>
             <div class="stat-label">Rebalances</div>
             <div class="stat-value">${p.total_rebalances}</div>
           </div>
+          <div>
+            <div class="stat-label">Lifetime Avg APR</div>
+            <div class="stat-value">${aprLine}</div>
+          </div>
         </div>
 
         <div class="fees-row">
           <span class="fees-label">Lifetime Fees Earned</span>
-          <span class="fees-value">${fmtNum(p.cumulative_fees0, 6)} ${sym0} / ${fmtNum(p.cumulative_fees1, 6)} ${sym1}</span>
+          <span class="fees-value">${fmtNum(p.cumulative_fees0, 6)} ${sym0} / ${fmtNum(p.cumulative_fees1, 6)} ${sym1}${feesUsd ? ' (' + feesUsd + ')' : ''}</span>
         </div>
 
         <div class="toggles">
