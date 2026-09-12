@@ -5,6 +5,8 @@ Tracks Snuggle vault LP positions (Base) for one or more wallets.
 
 import os
 import time
+import json
+import fcntl
 import base64
 import logging
 import threading
@@ -313,6 +315,130 @@ def _alert_polling_loop():
 # Started at module level (not inside __main__) so it runs under gunicorn too.
 _alert_thread = threading.Thread(target=_alert_polling_loop, daemon=True)
 _alert_thread.start()
+
+
+# ── Historical snapshots ─────────────────────────────────────────────────
+# Stored on a Railway persistent volume (/data by default — survives
+# redeploys and restarts, unlike the rest of this app's state). Only
+# records going forward from whenever this is first deployed — there's
+# no way to reconstruct past portfolio value from current on-chain state,
+# so "7d"/"30d" views will be sparse until that much real time has passed.
+HISTORY_DIR = os.environ.get("HISTORY_DIR", "/data")
+SNAPSHOT_INTERVAL = 3600  # 1 hour
+
+
+def _history_file_path(protocol: str) -> str:
+    return os.path.join(HISTORY_DIR, f"history_{protocol}.json")
+
+
+# flock() only reliably serializes across separate PROCESSES (e.g. multiple
+# gunicorn workers) — verified it does NOT reliably serialize across
+# threads within one process (a 20-thread test lost all but 1 write).
+# This app's background threads live within a single process, so a real
+# in-process Lock is required in addition to flock for cross-process safety.
+_history_lock = threading.Lock()
+
+
+def load_history(protocol: str) -> list:
+    path = _history_file_path(protocol)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                return json.load(f)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except Exception as e:
+        app.logger.warning("Failed to read history for %s: %s", protocol, e)
+        return []
+
+
+def append_history_snapshot(protocol: str, snapshot: dict):
+    os.makedirs(HISTORY_DIR, exist_ok=True)
+    path = _history_file_path(protocol)
+    with _history_lock:
+        try:
+            if not os.path.exists(path):
+                with open(path, "w") as f:
+                    json.dump([], f)
+            with open(path, "r+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    f.seek(0)
+                    try:
+                        history = json.load(f)
+                    except Exception:
+                        history = []
+                    history.append(snapshot)
+                    f.seek(0)
+                    f.truncate()
+                    json.dump(history, f)
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception as e:
+            app.logger.error("Failed to write history snapshot for %s: %s", protocol, e)
+
+
+def capture_snapshot(protocol_name: str, wallet: str, vault_address: str, view_helper_address: str):
+    if not wallet:
+        return
+    w3 = get_w3()
+    if not w3:
+        return
+    try:
+        positions = fetch_snuggle_positions(wallet, w3, vault_address, view_helper_address)
+        positions = enrich_with_usd_and_apr(positions)
+        portfolio = compute_portfolio_summary(positions)
+    except Exception as e:
+        app.logger.warning("Snapshot capture (%s) failed: %s", protocol_name, e)
+        return
+
+    snapshot = {
+        "ts": time.time(),
+        "total_value_usd": portfolio["total_value_usd"],
+        "total_fees_usd": portfolio["total_fees_usd"],
+        "blended_apr_pct": portfolio["blended_apr_pct"],
+        "position_count": portfolio["position_count"],
+        "out_of_range_count": portfolio["out_of_range_count"],
+    }
+    append_history_snapshot(protocol_name, snapshot)
+
+
+def _snapshot_loop():
+    while True:
+        try:
+            capture_snapshot("snuggle", DEFAULT_WALLET, VAULT_ADDRESS, VIEWHELPER_ADDRESS)
+            capture_snapshot("maxfi", DEFAULT_WALLET_MAXFI, MAXFI_VAULT_ADDRESS, MAXFI_VIEWHELPER_ADDRESS)
+        except Exception as e:
+            app.logger.error("Snapshot loop error: %s", e)
+        time.sleep(SNAPSHOT_INTERVAL)
+
+
+_snapshot_thread = threading.Thread(target=_snapshot_loop, daemon=True)
+_snapshot_thread.start()
+
+
+_RANGE_TO_SECONDS = {"7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "all": None}
+
+
+@app.route("/api/<protocol>/history")
+def api_history(protocol):
+    if protocol not in ("snuggle", "maxfi"):
+        return jsonify({"error": "Unknown protocol"}), 404
+
+    range_key = request.args.get("range", "30d")
+    if range_key not in _RANGE_TO_SECONDS:
+        return jsonify({"error": "range must be one of: 7d, 30d, 90d, all"}), 400
+
+    history = load_history(protocol)
+    window_seconds = _RANGE_TO_SECONDS[range_key]
+    if window_seconds is not None:
+        cutoff = time.time() - window_seconds
+        history = [s for s in history if s["ts"] >= cutoff]
+
+    return jsonify({"snapshots": history, "range": range_key})
 
 
 if __name__ == "__main__":

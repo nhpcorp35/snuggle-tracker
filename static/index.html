@@ -7,6 +7,8 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230f1318'/><text y='24' x='4' font-size='22' fill='%234a9eff'>◈</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-adapter-date-fns/3.0.0/chartjs-adapter-date-fns.bundle.min.js"></script>
 <style>
   :root {
     --bg:        #090c10;
@@ -85,6 +87,16 @@
   .protocol-header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
   .protocol-title { font-family: var(--mono); font-size: 16px; font-weight: 600; color: var(--text); text-transform: uppercase; letter-spacing: 0.08em; }
   .protocol-status { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+
+  .history-block { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 20px; margin-bottom: 20px; }
+  .history-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 10px; }
+  .history-title { font-family: var(--mono); font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+  .range-btns { display: flex; gap: 6px; }
+  .range-btn { font-family: var(--mono); font-size: 11px; color: var(--muted); background: transparent; border: 1px solid var(--border2); border-radius: 6px; padding: 4px 10px; cursor: pointer; transition: all 0.15s; }
+  .range-btn:hover { color: var(--text); border-color: var(--muted); }
+  .range-btn.active { color: var(--blue); border-color: var(--blue); background: var(--blue-dim); }
+  .history-chart-wrap { position: relative; height: 220px; }
+  .history-empty { font-family: var(--mono); font-size: 12px; color: var(--muted); text-align: center; padding: 40px 0; }
 </style>
 </head>
 <body>
@@ -106,6 +118,20 @@
       <span class="protocol-status" id="snuggle-status-text">Loading…</span>
     </div>
     <div id="snuggle-portfolio-container"></div>
+
+    <div class="history-block">
+      <div class="history-header">
+        <span class="history-title">Portfolio Value History</span>
+        <div class="range-btns" id="snuggle-range-btns">
+          <button class="range-btn" data-range="7d">7D</button>
+          <button class="range-btn active" data-range="30d">30D</button>
+          <button class="range-btn" data-range="90d">90D</button>
+          <button class="range-btn" data-range="all">All</button>
+        </div>
+      </div>
+      <div class="history-chart-wrap"><canvas id="snuggle-history-chart"></canvas></div>
+    </div>
+
     <div class="positions" id="snuggle-positions-container">
       <div class="empty-state loading-pulse"><div class="icon">◈</div><p>Fetching Snuggle positions…</p></div>
     </div>
@@ -118,6 +144,20 @@
       <span class="protocol-status" id="maxfi-status-text">Loading…</span>
     </div>
     <div id="maxfi-portfolio-container"></div>
+
+    <div class="history-block">
+      <div class="history-header">
+        <span class="history-title">Portfolio Value History</span>
+        <div class="range-btns" id="maxfi-range-btns">
+          <button class="range-btn" data-range="7d">7D</button>
+          <button class="range-btn active" data-range="30d">30D</button>
+          <button class="range-btn" data-range="90d">90D</button>
+          <button class="range-btn" data-range="all">All</button>
+        </div>
+      </div>
+      <div class="history-chart-wrap"><canvas id="maxfi-history-chart"></canvas></div>
+    </div>
+
     <div class="positions" id="maxfi-positions-container">
       <div class="empty-state loading-pulse"><div class="icon">◈</div><p>Fetching MaxFi positions…</p></div>
     </div>
@@ -136,19 +176,29 @@ let autoRefreshTimer = null;
 const PROTOCOLS = {
   snuggle: {
     endpoint: '/api/snuggle/positions',
+    historyEndpoint: '/api/snuggle/history',
     statusDot: document.getElementById('snuggle-status-dot'),
     statusText: document.getElementById('snuggle-status-text'),
     portfolioContainer: document.getElementById('snuggle-portfolio-container'),
     positionsContainer: document.getElementById('snuggle-positions-container'),
+    chartCanvas: document.getElementById('snuggle-history-chart'),
+    rangeBtnsContainer: document.getElementById('snuggle-range-btns'),
+    chartInstance: null,
+    currentRange: '30d',
     emptyLabel: 'Snuggle',
     autoToggleLabel: 'Auto-Snuggle',
   },
   maxfi: {
     endpoint: '/api/maxfi/positions',
+    historyEndpoint: '/api/maxfi/history',
     statusDot: document.getElementById('maxfi-status-dot'),
     statusText: document.getElementById('maxfi-status-text'),
     portfolioContainer: document.getElementById('maxfi-portfolio-container'),
     positionsContainer: document.getElementById('maxfi-positions-container'),
+    chartCanvas: document.getElementById('maxfi-history-chart'),
+    rangeBtnsContainer: document.getElementById('maxfi-range-btns'),
+    chartInstance: null,
+    currentRange: '30d',
     emptyLabel: 'MaxFi',
     autoToggleLabel: 'Auto-Rebalance',
   },
@@ -294,6 +344,105 @@ function renderPositions(el, positions, cfg) {
   }).join('');
 }
 
+async function loadHistory(name) {
+  const cfg = PROTOCOLS[name];
+  try {
+    const res = await fetch(`${cfg.historyEndpoint}?range=${cfg.currentRange}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'History request failed');
+    renderHistoryChart(cfg, data.snapshots || []);
+  } catch (e) {
+    // Non-fatal — history is a secondary feature, don't blow up the whole
+    // page load over it. Just show an empty-state message in the chart area.
+    if (cfg.chartInstance) { cfg.chartInstance.destroy(); cfg.chartInstance = null; }
+    cfg.chartCanvas.style.display = 'none';
+    const wrap = cfg.chartCanvas.parentElement;
+    let msg = wrap.querySelector('.history-empty');
+    if (!msg) { msg = document.createElement('div'); msg.className = 'history-empty'; wrap.appendChild(msg); }
+    msg.textContent = 'History unavailable: ' + e.message;
+  }
+}
+
+function renderHistoryChart(cfg, snapshots) {
+  const wrap = cfg.chartCanvas.parentElement;
+  const existingMsg = wrap.querySelector('.history-empty');
+
+  if (!snapshots.length) {
+    if (cfg.chartInstance) { cfg.chartInstance.destroy(); cfg.chartInstance = null; }
+    cfg.chartCanvas.style.display = 'none';
+    let msg = existingMsg;
+    if (!msg) { msg = document.createElement('div'); msg.className = 'history-empty'; wrap.appendChild(msg); }
+    msg.textContent = 'No history yet for this range — snapshots are recorded hourly starting from when this tracker was deployed.';
+    return;
+  }
+
+  if (existingMsg) existingMsg.remove();
+  cfg.chartCanvas.style.display = 'block';
+
+  const labels = snapshots.map(s => new Date(s.ts * 1000));
+  const values = snapshots.map(s => s.total_value_usd);
+  const fees = snapshots.map(s => s.total_fees_usd);
+
+  if (cfg.chartInstance) cfg.chartInstance.destroy();
+  cfg.chartInstance = new Chart(cfg.chartCanvas, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [
+        {
+          label: 'Total Value (USD)',
+          data: values,
+          borderColor: '#4a9eff',
+          backgroundColor: 'rgba(74,158,255,0.08)',
+          fill: true,
+          tension: 0.25,
+          pointRadius: 0,
+          yAxisID: 'y',
+        },
+        {
+          label: 'Total Fees Earned (USD)',
+          data: fees,
+          borderColor: '#2dd4d0',
+          backgroundColor: 'transparent',
+          fill: false,
+          tension: 0.25,
+          pointRadius: 0,
+          yAxisID: 'y1',
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: { type: 'time', time: { tooltipFormat: 'MMM d, HH:mm' },
+             ticks: { color: '#7a8899', font: { family: 'IBM Plex Mono', size: 10 } },
+             grid: { color: '#1d2330' } },
+        y: { position: 'left', ticks: { color: '#7a8899', font: { family: 'IBM Plex Mono', size: 10 } },
+             grid: { color: '#1d2330' } },
+        y1: { position: 'right', ticks: { color: '#7a8899', font: { family: 'IBM Plex Mono', size: 10 } },
+              grid: { display: false } },
+      },
+      plugins: {
+        legend: { labels: { color: '#c8d0de', font: { family: 'IBM Plex Mono', size: 11 } } },
+      },
+    },
+  });
+}
+
+for (const name of Object.keys(PROTOCOLS)) {
+  const cfg = PROTOCOLS[name];
+  cfg.rangeBtnsContainer.querySelectorAll('.range-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      cfg.rangeBtnsContainer.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      cfg.currentRange = btn.dataset.range;
+      loadHistory(name);
+    });
+  });
+}
+
 async function loadProtocol(name, bust) {
   const cfg = PROTOCOLS[name];
   cfg.statusDot.className = 'status-dot';
@@ -345,6 +494,8 @@ function resetAutoRefresh() {
 }
 
 loadAll(false);
+loadHistory('snuggle');
+loadHistory('maxfi');
 resetAutoRefresh();
 </script>
 
