@@ -95,6 +95,45 @@ def get_token_prices_usd(addresses: list) -> dict:
         return {}
 
 
+# ── Pool trading volume (GeckoTerminal OHLCV, by pool address) ─────────────
+# Same free/keyless API family as token prices above. Pool-level, not
+# wallet/position-specific — shared across anyone tracking the same
+# pool — so cached separately with a longer TTL (daily-granularity data
+# doesn't need to be fresher than that, and it keeps us well under
+# GeckoTerminal's free-tier rate limit).
+_GECKOTERMINAL_OHLCV_URL = "https://api.geckoterminal.com/api/v2/networks/base/pools/{}/ohlcv/day"
+_POOL_VOLUME_CACHE = {}
+_POOL_VOLUME_CACHE_TTL = 1800  # 30 minutes
+
+_VOLUME_RANGE_DAYS = {"7d": 7, "30d": 30, "60d": 60, "90d": 90, "180d": 180}
+
+
+def get_pool_volume_usd(pool_address: str, days: int) -> list:
+    """Returns [{"ts": unix_seconds, "volume_usd": float}, ...] in
+    chronological order (oldest first), one entry per day, for the
+    given pool over the last `days` days. Raises on failure — unlike
+    get_token_prices_usd, there's no sane "missing" fallback for a
+    whole volume chart, so the caller surfaces the error instead of
+    silently showing an empty chart."""
+    cache_key = f"{pool_address.lower()}:{days}"
+    cached = _POOL_VOLUME_CACHE.get(cache_key)
+    if cached and time.time() - cached["fetched_at"] < _POOL_VOLUME_CACHE_TTL:
+        return cached["candles"]
+
+    url = _GECKOTERMINAL_OHLCV_URL.format(pool_address)
+    resp = requests.get(url, params={"aggregate": 1, "limit": days, "currency": "usd"}, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    ohlcv_list = data.get("data", {}).get("attributes", {}).get("ohlcv_list", [])
+    # GeckoTerminal returns newest-first; charts want chronological.
+    candles = sorted(
+        ({"ts": row[0], "volume_usd": row[5]} for row in ohlcv_list),
+        key=lambda c: c["ts"],
+    )
+    _POOL_VOLUME_CACHE[cache_key] = {"candles": candles, "fetched_at": time.time()}
+    return candles
+
+
 def enrich_with_usd_and_apr(positions: list) -> list:
     """Adds range_width_pct, USD values, and a lifetime-average APR
     estimate to each position. Fields are None where price data or
@@ -550,6 +589,7 @@ def capture_snapshot(protocol_name: str, wallet: str, vault_address: str, view_h
                 baseline_ts = now
             new_known[tid] = {
                 "pool": f"{p['token0']['symbol']}/{p['token1']['symbol']}",
+                "pool_address": p["pool_address"],
                 "last_value_usd": p["position_value_usd"],
                 "last_seen": now,
                 "baseline_value_usd": baseline_value_usd,
@@ -634,6 +674,36 @@ def api_closed_positions(protocol):
     closed = _read_json_locked(_closed_positions_file_path(protocol), [])
     closed_sorted = sorted(closed, key=lambda c: c["closed_at"], reverse=True)
     return jsonify({"closed": closed_sorted})
+
+
+@app.route("/api/<protocol>/pool-volume/<int:token_id>")
+def api_pool_volume(protocol, token_id):
+    """Pool trading volume (USD), daily bars — external market data via
+    GeckoTerminal, not our own tracked history. Looks up the position's
+    pool_address from known_<protocol>.json (populated by the
+    background snapshot loop) rather than an RPC call, so this stays
+    fast even for a position the live wallet fetch hasn't touched."""
+    if protocol not in ("snuggle", "maxfi"):
+        return jsonify({"error": "Unknown protocol"}), 404
+
+    range_key = request.args.get("range", "30d")
+    if range_key not in _VOLUME_RANGE_DAYS:
+        return jsonify({"error": "range must be one of: 7d, 30d, 60d, 90d, 180d"}), 400
+
+    known = _read_json_locked(_known_positions_file_path(protocol), {})
+    entry = known.get(str(token_id))
+    pool_address = entry.get("pool_address") if entry else None
+    if not pool_address:
+        return jsonify({"error": "Pool address not yet known for this position — "
+                                  "check back after the next snapshot cycle."}), 404
+
+    try:
+        candles = get_pool_volume_usd(pool_address, _VOLUME_RANGE_DAYS[range_key])
+    except Exception as e:
+        app.logger.warning("Pool volume fetch failed for %s: %s", pool_address, e)
+        return jsonify({"error": "Volume data unavailable right now"}), 502
+
+    return jsonify({"candles": candles, "range": range_key, "token_id": token_id})
 
 
 if __name__ == "__main__":

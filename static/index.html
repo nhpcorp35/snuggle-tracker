@@ -116,6 +116,7 @@
   .pos-history-toggle { font-family: var(--mono); font-size: 11px; color: var(--blue); cursor: pointer; margin-top: 12px; user-select: none; }
   .pos-history-toggle:hover { opacity: 0.8; }
   .pos-history-panel { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+  .pos-history-subheader { font-family: var(--mono); font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 14px 0 6px; }
 
   .closed-block { margin-top: 16px; }
   .closed-toggle { font-family: var(--mono); font-size: 11px; color: var(--muted); cursor: pointer; user-select: none; }
@@ -479,6 +480,16 @@ function renderPositions(el, positions, cfg, name) {
             <button class="range-btn" onclick="setPositionHistoryRange('${name}', ${p.token_id}, 'all', this)">All</button>
           </div>
           <div class="history-chart-wrap" style="height:160px;"><canvas id="pos-history-chart-${posKey}"></canvas></div>
+
+          <div class="pos-history-subheader">Pool Volume (USD)</div>
+          <div class="range-btns" id="pos-volume-btns-${posKey}">
+            <button class="range-btn" onclick="setPositionVolumeRange('${name}', ${p.token_id}, '7d', this)">7D</button>
+            <button class="range-btn active" onclick="setPositionVolumeRange('${name}', ${p.token_id}, '30d', this)">30D</button>
+            <button class="range-btn" onclick="setPositionVolumeRange('${name}', ${p.token_id}, '60d', this)">60D</button>
+            <button class="range-btn" onclick="setPositionVolumeRange('${name}', ${p.token_id}, '90d', this)">90D</button>
+            <button class="range-btn" onclick="setPositionVolumeRange('${name}', ${p.token_id}, '180d', this)">180D</button>
+          </div>
+          <div class="history-chart-wrap" style="height:120px;"><canvas id="pos-volume-chart-${posKey}"></canvas></div>
         </div>
       </div>
     `;
@@ -586,6 +597,8 @@ for (const name of Object.keys(PROTOCOLS)) {
 
 const positionChartInstances = {};
 const positionCurrentRange = {};
+const positionVolumeChartInstances = {};
+const positionVolumeCurrentRange = {};
 const positionPanelOpened = {}; // lazy-load: don't fetch until first expand
 
 function togglePositionHistory(name, tokenId) {
@@ -606,7 +619,9 @@ function togglePositionHistory(name, tokenId) {
   if (!positionPanelOpened[posKey]) {
     positionPanelOpened[posKey] = true;
     positionCurrentRange[posKey] = '30d';
+    positionVolumeCurrentRange[posKey] = '30d';
     loadPositionHistory(name, tokenId, '30d');
+    loadPositionVolume(name, tokenId, '30d');
   }
 }
 
@@ -634,6 +649,15 @@ function restoreOpenPositionHistories(name, positions) {
       });
     }
     loadPositionHistory(name, p.token_id, range);
+
+    const volRange = positionVolumeCurrentRange[posKey] || '30d';
+    const volBtnsContainer = document.getElementById(`pos-volume-btns-${posKey}`);
+    if (volBtnsContainer) {
+      volBtnsContainer.querySelectorAll('.range-btn').forEach(b => {
+        b.classList.toggle('active', b.textContent.trim().toLowerCase() === volRange.toLowerCase());
+      });
+    }
+    loadPositionVolume(name, p.token_id, volRange);
   }
 }
 
@@ -702,6 +726,80 @@ function renderPositionHistoryChart(posKey, canvas, snapshots) {
       maintainAspectRatio: false,
       scales: {
         x: { type: 'time', time: { tooltipFormat: 'MMM d, HH:mm' },
+             ticks: { color: '#7a8899', font: { family: 'IBM Plex Mono', size: 9 } },
+             grid: { color: '#1d2330' } },
+        y: { ticks: { color: '#7a8899', font: { family: 'IBM Plex Mono', size: 9 } },
+             grid: { color: '#1d2330' } },
+      },
+      plugins: { legend: { display: false } },
+    },
+  });
+}
+
+function setPositionVolumeRange(name, tokenId, range, btnEl) {
+  const posKey = `${name}-${tokenId}`;
+  positionVolumeCurrentRange[posKey] = range;
+  btnEl.parentElement.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active'));
+  btnEl.classList.add('active');
+  loadPositionVolume(name, tokenId, range);
+}
+
+async function loadPositionVolume(name, tokenId, range) {
+  const posKey = `${name}-${tokenId}`;
+  const canvas = document.getElementById(`pos-volume-chart-${posKey}`);
+  if (!canvas) return;
+  try {
+    const res = await fetch(`/api/${name}/pool-volume/${tokenId}?range=${range}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Request failed');
+    renderPositionVolumeChart(posKey, canvas, data.candles || []);
+  } catch (e) {
+    if (positionVolumeChartInstances[posKey]) { positionVolumeChartInstances[posKey].destroy(); positionVolumeChartInstances[posKey] = null; }
+    canvas.style.display = 'none';
+    const wrap = canvas.parentElement;
+    let msg = wrap.querySelector('.volume-empty');
+    if (!msg) { msg = document.createElement('div'); msg.className = 'history-empty volume-empty'; wrap.appendChild(msg); }
+    msg.textContent = 'Volume unavailable: ' + e.message;
+  }
+}
+
+function renderPositionVolumeChart(posKey, canvas, candles) {
+  const wrap = canvas.parentElement;
+  const existingMsg = wrap.querySelector('.volume-empty');
+
+  if (!candles.length) {
+    if (positionVolumeChartInstances[posKey]) { positionVolumeChartInstances[posKey].destroy(); positionVolumeChartInstances[posKey] = null; }
+    canvas.style.display = 'none';
+    let msg = existingMsg;
+    if (!msg) { msg = document.createElement('div'); msg.className = 'history-empty volume-empty'; wrap.appendChild(msg); }
+    msg.textContent = 'No volume data available for this pool.';
+    return;
+  }
+
+  if (existingMsg) existingMsg.remove();
+  canvas.style.display = 'block';
+
+  const labels = candles.map(c => new Date(c.ts * 1000));
+  const values = candles.map(c => c.volume_usd);
+
+  if (positionVolumeChartInstances[posKey]) positionVolumeChartInstances[posKey].destroy();
+  positionVolumeChartInstances[posKey] = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: labels,
+      datasets: [{
+        label: 'Pool Volume (USD)',
+        data: values,
+        backgroundColor: 'rgba(32,210,208,0.35)',
+        borderColor: 'rgba(32,210,208,0.6)',
+        borderWidth: 1,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { type: 'time', time: { unit: 'day', tooltipFormat: 'MMM d' },
              ticks: { color: '#7a8899', font: { family: 'IBM Plex Mono', size: 9 } },
              grid: { color: '#1d2330' } },
         y: { ticks: { color: '#7a8899', font: { family: 'IBM Plex Mono', size: 9 } },
