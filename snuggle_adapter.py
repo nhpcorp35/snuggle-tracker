@@ -296,6 +296,8 @@ def fetch_snuggle_positions(wallet: str, w3) -> list:
             "amount0": amount0,
             "amount1": amount1,
             "position_adapter": position_adapter,
+            "range_width_bps": range_width_bps,
+            "deposit_timestamp": deposit_ts,
         })
 
     return results
