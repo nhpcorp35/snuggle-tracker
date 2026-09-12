@@ -298,6 +298,7 @@ def fetch_snuggle_positions(wallet: str, w3) -> list:
             "position_adapter": position_adapter,
             "range_width_bps": range_width_bps,
             "deposit_timestamp": deposit_ts,
+            "out_of_range_since": out_of_range_since,
         })
 
     return results

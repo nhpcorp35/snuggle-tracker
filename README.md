@@ -9,8 +9,10 @@ against Snuggle's own UI on 4 real positions (Uniswap V3 + PancakeSwap V3)
 | Var | Required | Description |
 |---|---|---|
 | `ALCHEMY_BASE` | Yes | Base RPC URL (Alchemy or similar) |
-| `DEFAULT_WALLET` | No | Wallet address to use when none is passed in the UI |
+| `DEFAULT_WALLET` | No | Wallet address to use when none is passed in the UI; also the wallet checked by the out-of-range alert thread |
 | `PASSWORD` | No | If set, enables HTTP Basic Auth on the whole app |
+| `PUSHOVER_TOKEN` / `PUSHOVER_USER` | No | If both set, sends a Pushover alert when a position has been out of range longer than `OUT_OF_RANGE_ALERT_HOURS` |
+| `OUT_OF_RANGE_ALERT_HOURS` | No (default 6) | Threshold, in hours, before an out-of-range position triggers an alert |
 | `PORT` | Set by Railway | — |
 
 USD pricing uses GeckoTerminal's free, keyless onchain API — no signup,

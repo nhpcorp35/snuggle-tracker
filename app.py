@@ -7,6 +7,7 @@ import os
 import time
 import base64
 import logging
+import threading
 
 import requests
 from flask import Flask, jsonify, request, Response
@@ -125,7 +126,34 @@ def enrich_with_usd_and_apr(positions: list) -> list:
             lifetime_apr_pct = (cumulative_fees_usd / position_value_usd) * (365.0 / days_held) * 100.0
         p["lifetime_apr_pct"] = lifetime_apr_pct
 
+        # Out-of-range duration, in seconds. 0 means currently in range.
+        p["out_of_range_seconds"] = (now - p["out_of_range_since"]) if p["out_of_range_since"] > 0 else 0
+
     return positions
+
+
+def compute_portfolio_summary(positions: list) -> dict:
+    """Aggregate totals across all positions. Value-weighted average
+    APR (weighted by each position's USD value) rather than a naive
+    average, so a small position's noisy APR doesn't skew the total."""
+    total_value_usd = sum(p["position_value_usd"] for p in positions if p["position_value_usd"] is not None)
+    total_fees_usd = sum(p["cumulative_fees_usd"] for p in positions if p["cumulative_fees_usd"] is not None)
+
+    weighted_apr_sum = 0.0
+    weight_total = 0.0
+    for p in positions:
+        if p["lifetime_apr_pct"] is not None and p["position_value_usd"]:
+            weighted_apr_sum += p["lifetime_apr_pct"] * p["position_value_usd"]
+            weight_total += p["position_value_usd"]
+    blended_apr_pct = (weighted_apr_sum / weight_total) if weight_total > 0 else None
+
+    return {
+        "total_value_usd": total_value_usd if total_value_usd > 0 else None,
+        "total_fees_usd": total_fees_usd if total_fees_usd > 0 else None,
+        "blended_apr_pct": blended_apr_pct,
+        "position_count": len(positions),
+        "out_of_range_count": sum(1 for p in positions if not p["in_range"]),
+    }
 
 
 @app.route("/")
@@ -149,8 +177,8 @@ def api_snuggle_positions():
     bust = request.args.get("bust", "0") == "1"
     cached = _cache.get(cache_key)
     if not bust and cached and time.time() - cached["fetched_at"] < CACHE_TTL:
-        return jsonify({"positions": cached["positions"], "cached": True,
-                        "fetched_at": cached["fetched_at"]})
+        return jsonify({"positions": cached["positions"], "portfolio": cached["portfolio"],
+                        "cached": True, "fetched_at": cached["fetched_at"]})
 
     w3 = get_w3()
     if not w3:
@@ -164,19 +192,96 @@ def api_snuggle_positions():
         stale = _stale_cache.get(cache_key)
         if stale:
             app.logger.warning("Serving stale data for %s", wallet)
-            return jsonify({"positions": stale["positions"], "cached": True, "stale": True,
-                            "fetched_at": stale["fetched_at"]})
+            return jsonify({"positions": stale["positions"], "portfolio": stale["portfolio"],
+                            "cached": True, "stale": True, "fetched_at": stale["fetched_at"]})
         return jsonify({"error": str(e)}), 500
 
-    result = {"positions": positions, "fetched_at": time.time()}
+    portfolio = compute_portfolio_summary(positions)
+    result = {"positions": positions, "portfolio": portfolio, "fetched_at": time.time()}
     _cache[cache_key] = result
     _stale_cache[cache_key] = result
-    return jsonify({"positions": positions, "cached": False, "fetched_at": result["fetched_at"]})
+    return jsonify({"positions": positions, "portfolio": portfolio, "cached": False,
+                    "fetched_at": result["fetched_at"]})
 
 
 @app.route("/api/health")
 def health():
     return jsonify({"ok": True, "rpc_configured": bool(ALCHEMY_BASE)})
+
+
+# ── Out-of-range Pushover alerts ─────────────────────────────────────────
+# Background thread polling every ALERT_CHECK_INTERVAL seconds. Alerts once
+# per "stuck episode" (tracked by out_of_range_since timestamp) rather than
+# repeatedly — a position that's been out of range for days won't spam you
+# every poll, only once when it first crosses the threshold.
+PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
+PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
+OUT_OF_RANGE_ALERT_HOURS = float(os.environ.get("OUT_OF_RANGE_ALERT_HOURS", "6"))
+ALERT_CHECK_INTERVAL = 600  # 10 minutes
+
+_alerted_episodes = {}  # {token_id: out_of_range_since value already alerted for}
+
+
+def send_pushover(title: str, message: str):
+    if not PUSHOVER_TOKEN or not PUSHOVER_USER:
+        app.logger.warning("Pushover not configured — skipping alert: %s", title)
+        return
+    try:
+        requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data={"token": PUSHOVER_TOKEN, "user": PUSHOVER_USER, "title": title, "message": message},
+            timeout=8,
+        )
+    except Exception as e:
+        app.logger.warning("Pushover send failed: %s", e)
+
+
+def check_out_of_range_alerts():
+    """Runs in a background thread. Checks DEFAULT_WALLET's positions
+    and fires a Pushover alert for any position freshly crossing the
+    out-of-range threshold."""
+    if not DEFAULT_WALLET or not PUSHOVER_TOKEN or not PUSHOVER_USER:
+        return  # nothing to check / nowhere to send — stay quiet, don't spam logs on every poll
+    w3 = get_w3()
+    if not w3:
+        return
+    try:
+        positions = fetch_snuggle_positions(DEFAULT_WALLET, w3)
+    except Exception as e:
+        app.logger.warning("Alert check: fetch failed: %s", e)
+        return
+
+    threshold_seconds = OUT_OF_RANGE_ALERT_HOURS * 3600
+    for p in positions:
+        oor_since = p["out_of_range_since"]
+        token_id = p["token_id"]
+        if oor_since == 0:
+            _alerted_episodes.pop(token_id, None)  # back in range — reset for next episode
+            continue
+        duration = time.time() - oor_since
+        if duration >= threshold_seconds and _alerted_episodes.get(token_id) != oor_since:
+            sym0, sym1 = p["token0"]["symbol"], p["token1"]["symbol"]
+            hours = duration / 3600
+            send_pushover(
+                "Snuggle position stuck out of range",
+                f"{sym0}/{sym1} #{token_id} has been out of range for {hours:.1f}h. "
+                f"Check if auto-Snuggle/keeper is functioning.",
+            )
+            _alerted_episodes[token_id] = oor_since
+
+
+def _alert_polling_loop():
+    while True:
+        try:
+            check_out_of_range_alerts()
+        except Exception as e:
+            app.logger.error("Alert polling loop error: %s", e)
+        time.sleep(ALERT_CHECK_INTERVAL)
+
+
+# Started at module level (not inside __main__) so it runs under gunicorn too.
+_alert_thread = threading.Thread(target=_alert_polling_loop, daemon=True)
+_alert_thread.start()
 
 
 if __name__ == "__main__":

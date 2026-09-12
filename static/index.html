@@ -72,6 +72,14 @@
 
   .toggles { display: flex; gap: 14px; margin-top: 10px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
   .toggle-on { color: var(--green); }
+
+  .portfolio-bar { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 20px; margin-bottom: 20px; }
+  .portfolio-stat-label { font-family: var(--mono); font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px; }
+  .portfolio-stat-value { font-family: var(--mono); font-size: 20px; font-weight: 600; color: var(--text); }
+  .portfolio-stat-value.accent { color: var(--blue); }
+  .portfolio-stat-value.warn { color: var(--amber); }
+
+  .oor-duration { font-family: var(--mono); font-size: 11px; color: var(--amber); margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -91,6 +99,8 @@
 
   <div class="error-banner" id="error-banner"></div>
 
+  <div id="portfolio-bar-container"></div>
+
   <div class="positions" id="positions-container">
     <div class="empty-state loading-pulse">
       <div class="icon">◈</div>
@@ -101,10 +111,14 @@
 
 <script>
 const container = document.getElementById('positions-container');
+const portfolioContainer = document.getElementById('portfolio-bar-container');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 const errorBanner = document.getElementById('error-banner');
 const loadBtn = document.getElementById('load-btn');
+
+const AUTO_REFRESH_MS = 90000; // 90s — aligned with the backend's 120s cache TTL
+let autoRefreshTimer = null;
 
 function fmtNum(n, decimals) {
   if (n === null || n === undefined) return '—';
@@ -121,8 +135,50 @@ function fmtPct(n, decimals) {
   return Number(n).toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals }) + '%';
 }
 
+function fmtDuration(seconds) {
+  if (!seconds || seconds <= 0) return null;
+  const hours = seconds / 3600;
+  if (hours < 1) return Math.round(seconds / 60) + 'm';
+  if (hours < 48) return hours.toFixed(1) + 'h';
+  return (hours / 24).toFixed(1) + 'd';
+}
+
 function feeTierLabel(feeRaw) {
   return (feeRaw / 10000).toFixed(2) + '%';
+}
+
+function renderPortfolio(portfolio) {
+  if (!portfolio || portfolio.position_count === 0) {
+    portfolioContainer.innerHTML = '';
+    return;
+  }
+  const totalValue = fmtUsd(portfolio.total_value_usd) || '—';
+  const totalFees = fmtUsd(portfolio.total_fees_usd) || '—';
+  const blendedApr = fmtPct(portfolio.blended_apr_pct, 1);
+  const oorNote = portfolio.out_of_range_count > 0
+    ? `<div class="portfolio-stat-value warn">${portfolio.out_of_range_count} / ${portfolio.position_count}</div>`
+    : `<div class="portfolio-stat-value">0 / ${portfolio.position_count}</div>`;
+
+  portfolioContainer.innerHTML = `
+    <div class="portfolio-bar">
+      <div>
+        <div class="portfolio-stat-label">Total Value</div>
+        <div class="portfolio-stat-value accent">${totalValue}</div>
+      </div>
+      <div>
+        <div class="portfolio-stat-label">Total Fees Earned</div>
+        <div class="portfolio-stat-value">${totalFees}</div>
+      </div>
+      <div>
+        <div class="portfolio-stat-label">Blended Avg APR</div>
+        <div class="portfolio-stat-value">${blendedApr}</div>
+      </div>
+      <div>
+        <div class="portfolio-stat-label">Out of Range</div>
+        ${oorNote}
+      </div>
+    </div>
+  `;
 }
 
 function renderPositions(positions) {
@@ -141,6 +197,7 @@ function renderPositions(positions) {
     const rangeClass = p.in_range ? 'in-range' : 'out-range';
     const badgeClass = p.in_range ? 'in' : 'out';
     const badgeText = p.in_range ? 'In Range' : 'Out of Range';
+    const oorDuration = fmtDuration(p.out_of_range_seconds);
 
     const holdingsLine = (p.amount0 !== null && p.amount1 !== null)
       ? `${fmtNum(p.amount0, 6)} ${sym0} + ${fmtNum(p.amount1, 6)} ${sym1}`
@@ -162,7 +219,10 @@ function renderPositions(positions) {
             <span class="fee-tag">${feeTierLabel(p.fee_tier)}</span>
             <span class="id-tag">#${p.token_id}</span>
           </div>
-          <span class="range-badge ${badgeClass}">${badgeText}</span>
+          <div style="text-align:right;">
+            <span class="range-badge ${badgeClass}">${badgeText}</span>
+            ${oorDuration ? `<div class="oor-duration">for ${oorDuration}</div>` : ''}
+          </div>
         </div>
 
         <div class="pos-grid">
@@ -222,6 +282,7 @@ async function loadPositions(bust) {
     }
 
     renderPositions(data.positions || []);
+    renderPortfolio(data.portfolio);
     statusDot.classList.add('green');
     const cachedNote = data.cached ? (data.stale ? ' (stale — last good fetch)' : ' (cached)') : '';
     statusText.textContent = `${data.positions.length} position(s) · fetched ${new Date(data.fetched_at * 1000).toLocaleTimeString()}${cachedNote}`;
@@ -230,12 +291,19 @@ async function loadPositions(bust) {
     errorBanner.classList.add('visible');
     statusText.textContent = 'Failed to load';
     container.innerHTML = '';
+    portfolioContainer.innerHTML = '';
   } finally {
     loadBtn.disabled = false;
   }
 }
 
+function resetAutoRefresh() {
+  if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  autoRefreshTimer = setInterval(() => loadPositions(false), AUTO_REFRESH_MS);
+}
+
 loadPositions(false);
+resetAutoRefresh();
 </script>
 
 </body>
