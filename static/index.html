@@ -101,6 +101,14 @@
   .pos-history-toggle { font-family: var(--mono); font-size: 11px; color: var(--blue); cursor: pointer; margin-top: 12px; user-select: none; }
   .pos-history-toggle:hover { opacity: 0.8; }
   .pos-history-panel { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+
+  .closed-block { margin-top: 16px; }
+  .closed-toggle { font-family: var(--mono); font-size: 11px; color: var(--muted); cursor: pointer; user-select: none; }
+  .closed-toggle:hover { color: var(--text); }
+  .closed-list { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+  .closed-item { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; font-family: var(--mono); font-size: 12px; gap: 10px; flex-wrap: wrap; }
+  .closed-item-pool { color: var(--text); }
+  .closed-item-meta { color: var(--muted); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -139,6 +147,8 @@
     <div class="positions" id="snuggle-positions-container">
       <div class="empty-state loading-pulse"><div class="icon">◈</div><p>Fetching Snuggle positions…</p></div>
     </div>
+
+    <div id="snuggle-closed-container"></div>
   </div>
 
   <div class="protocol-section">
@@ -165,6 +175,8 @@
     <div class="positions" id="maxfi-positions-container">
       <div class="empty-state loading-pulse"><div class="icon">◈</div><p>Fetching MaxFi positions…</p></div>
     </div>
+
+    <div id="maxfi-closed-container"></div>
   </div>
 </main>
 
@@ -181,10 +193,12 @@ const PROTOCOLS = {
   snuggle: {
     endpoint: '/api/snuggle/positions',
     historyEndpoint: '/api/snuggle/history',
+    closedEndpoint: '/api/snuggle/closed',
     statusDot: document.getElementById('snuggle-status-dot'),
     statusText: document.getElementById('snuggle-status-text'),
     portfolioContainer: document.getElementById('snuggle-portfolio-container'),
     positionsContainer: document.getElementById('snuggle-positions-container'),
+    closedContainer: document.getElementById('snuggle-closed-container'),
     chartCanvas: document.getElementById('snuggle-history-chart'),
     rangeBtnsContainer: document.getElementById('snuggle-range-btns'),
     chartInstance: null,
@@ -195,10 +209,12 @@ const PROTOCOLS = {
   maxfi: {
     endpoint: '/api/maxfi/positions',
     historyEndpoint: '/api/maxfi/history',
+    closedEndpoint: '/api/maxfi/closed',
     statusDot: document.getElementById('maxfi-status-dot'),
     statusText: document.getElementById('maxfi-status-text'),
     portfolioContainer: document.getElementById('maxfi-portfolio-container'),
     positionsContainer: document.getElementById('maxfi-positions-container'),
+    closedContainer: document.getElementById('maxfi-closed-container'),
     chartCanvas: document.getElementById('maxfi-history-chart'),
     rangeBtnsContainer: document.getElementById('maxfi-range-btns'),
     chartInstance: null,
@@ -589,6 +605,59 @@ function renderPositionHistoryChart(posKey, canvas, snapshots) {
   });
 }
 
+let closedListShown = { snuggle: false, maxfi: false };
+
+async function loadClosedPositions(name) {
+  const cfg = PROTOCOLS[name];
+  try {
+    const res = await fetch(cfg.closedEndpoint);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Request failed');
+    renderClosedPositions(name, data.closed || []);
+  } catch (e) {
+    cfg.closedContainer.innerHTML = '';
+  }
+}
+
+function fmtAgo(ts) {
+  const seconds = Date.now() / 1000 - ts;
+  const days = seconds / 86400;
+  if (days < 1) return Math.round(seconds / 3600) + 'h ago';
+  return days.toFixed(1) + 'd ago';
+}
+
+function renderClosedPositions(name, closed) {
+  const cfg = PROTOCOLS[name];
+  if (!closed.length) {
+    cfg.closedContainer.innerHTML = '';
+    return;
+  }
+
+  const isShown = closedListShown[name];
+  const itemsHtml = closed.map(c => `
+    <div class="closed-item">
+      <span class="closed-item-pool">${c.pool || '—'} #${c.token_id}</span>
+      <span class="closed-item-meta">closed ${fmtAgo(c.closed_at)} · last value ${c.last_value_usd !== null && c.last_value_usd !== undefined ? '$' + c.last_value_usd.toFixed(2) : '—'}</span>
+    </div>
+  `).join('');
+
+  cfg.closedContainer.innerHTML = `
+    <div class="closed-block">
+      <div class="closed-toggle" onclick="toggleClosedList('${name}')">
+        ${isShown ? '▾' : '▸'} Closed Positions (${closed.length})
+      </div>
+      <div class="closed-list" style="display:${isShown ? 'flex' : 'none'};">
+        ${itemsHtml}
+      </div>
+    </div>
+  `;
+}
+
+function toggleClosedList(name) {
+  closedListShown[name] = !closedListShown[name];
+  loadClosedPositions(name);
+}
+
 async function loadProtocol(name, bust) {
   const cfg = PROTOCOLS[name];
   cfg.statusDot.className = 'status-dot';
@@ -628,6 +697,9 @@ async function loadAll(bust) {
   const errors = (await Promise.all([loadProtocol('snuggle', bust), loadProtocol('maxfi', bust)]))
     .filter(Boolean);
 
+  loadClosedPositions('snuggle');
+  loadClosedPositions('maxfi');
+
   if (errors.length) {
     errorBanner.textContent = 'Error: ' + errors.join(' | ');
     errorBanner.classList.add('visible');
@@ -643,6 +715,8 @@ function resetAutoRefresh() {
 loadAll(false);
 loadHistory('snuggle');
 loadHistory('maxfi');
+loadClosedPositions('snuggle');
+loadClosedPositions('maxfi');
 resetAutoRefresh();
 </script>
 

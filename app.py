@@ -339,10 +339,9 @@ def _history_file_path(protocol: str) -> str:
 _history_lock = threading.Lock()
 
 
-def load_history(protocol: str) -> list:
-    path = _history_file_path(protocol)
+def _read_json_locked(path: str, default):
     if not os.path.exists(path):
-        return []
+        return default
     try:
         with open(path, "r") as f:
             fcntl.flock(f, fcntl.LOCK_SH)
@@ -351,34 +350,54 @@ def load_history(protocol: str) -> list:
             finally:
                 fcntl.flock(f, fcntl.LOCK_UN)
     except Exception as e:
-        app.logger.warning("Failed to read history for %s: %s", protocol, e)
-        return []
+        app.logger.warning("Failed to read %s: %s", path, e)
+        return default
+
+
+def _write_json_locked_nolock(path: str, data):
+    """Does the flock-protected file write WITHOUT acquiring the
+    in-process _history_lock — for callers that already hold it as
+    part of a larger read-modify-write critical section."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                json.dump(data if isinstance(data, list) else [], f)
+        with open(path, "r+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                f.truncate()
+                json.dump(data, f)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except Exception as e:
+        app.logger.error("Failed to write %s: %s", path, e)
+
+
+def _write_json_locked(path: str, data):
+    with _history_lock:  # single in-process lock covers all state files — writes are infrequent
+        _write_json_locked_nolock(path, data)
+
+
+def load_history(protocol: str) -> list:
+    return _read_json_locked(_history_file_path(protocol), [])
 
 
 def append_history_snapshot(protocol: str, snapshot: dict):
-    os.makedirs(HISTORY_DIR, exist_ok=True)
     path = _history_file_path(protocol)
-    with _history_lock:
-        try:
-            if not os.path.exists(path):
-                with open(path, "w") as f:
-                    json.dump([], f)
-            with open(path, "r+") as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                try:
-                    f.seek(0)
-                    try:
-                        history = json.load(f)
-                    except Exception:
-                        history = []
-                    history.append(snapshot)
-                    f.seek(0)
-                    f.truncate()
-                    json.dump(history, f)
-                finally:
-                    fcntl.flock(f, fcntl.LOCK_UN)
-        except Exception as e:
-            app.logger.error("Failed to write history snapshot for %s: %s", protocol, e)
+    with _history_lock:  # held for the ENTIRE read-modify-write — do not release in between
+        history = _read_json_locked(path, [])
+        history.append(snapshot)
+        _write_json_locked_nolock(path, history)
+
+
+def _known_positions_file_path(protocol: str) -> str:
+    return os.path.join(HISTORY_DIR, f"known_{protocol}.json")
+
+
+def _closed_positions_file_path(protocol: str) -> str:
+    return os.path.join(HISTORY_DIR, f"closed_{protocol}.json")
 
 
 def capture_snapshot(protocol_name: str, wallet: str, vault_address: str, view_helper_address: str):
@@ -392,6 +411,9 @@ def capture_snapshot(protocol_name: str, wallet: str, vault_address: str, view_h
         positions = enrich_with_usd_and_apr(positions)
         portfolio = compute_portfolio_summary(positions)
     except Exception as e:
+        # Deliberately return before touching known/closed state below —
+        # a failed fetch must never be mistaken for "wallet has zero
+        # positions now", which would falsely mark everything closed.
         app.logger.warning("Snapshot capture (%s) failed: %s", protocol_name, e)
         return
 
@@ -421,6 +443,64 @@ def capture_snapshot(protocol_name: str, wallet: str, vault_address: str, view_h
         }
         append_history_snapshot(f"{protocol_name}_pos_{p['token_id']}", pos_snapshot)
 
+    # ── Discover new / remove closed positions ──────────────────────────
+    # "Known" = the set of token_ids seen live as of the last successful
+    # check. New positions need no special handling — they just start
+    # accumulating per-position history above, automatically. Closed
+    # ones (previously known, now absent) get a final marker appended to
+    # their history and move into the closed-positions record.
+    known_path = _known_positions_file_path(protocol_name)
+    closed_path = _closed_positions_file_path(protocol_name)
+
+    with _history_lock:
+        known = _read_json_locked(known_path, {})  # {str(token_id): {"pool": ..., "last_seen": ts}}
+        current_ids = {str(p["token_id"]) for p in positions}
+        current_by_id = {str(p["token_id"]): p for p in positions}
+
+        closed_now = [tid for tid in known if tid not in current_ids]
+
+        if closed_now:
+            closed_list = _read_json_locked(closed_path, [])
+            for tid in closed_now:
+                last_known = known[tid]
+                closed_list.append({
+                    "token_id": int(tid),
+                    "pool": last_known.get("pool"),
+                    "closed_at": now,
+                    "last_value_usd": last_known.get("last_value_usd"),
+                })
+                # Final marker in the position's own history file, so its
+                # chart visibly shows where it ends rather than just
+                # stopping with no explanation.
+                _append_to_list_at_path(
+                    _history_file_path(f"{protocol_name}_pos_{tid}"),
+                    {"ts": now, "token_id": int(tid), "closed": True},
+                )
+                _alerted_episodes.pop((_PROTOCOL_DISPLAY_NAME.get(protocol_name, protocol_name), int(tid)), None)
+            _write_json_locked_nolock(closed_path, closed_list)
+
+        # Rebuild the known set from current positions (drops closed ones,
+        # adds new ones, refreshes last_value_usd/last_seen for the rest).
+        new_known = {}
+        for tid in current_ids:
+            p = current_by_id[tid]
+            new_known[tid] = {
+                "pool": f"{p['token0']['symbol']}/{p['token1']['symbol']}",
+                "last_value_usd": p["position_value_usd"],
+                "last_seen": now,
+            }
+        _write_json_locked_nolock(known_path, new_known)
+
+
+def _append_to_list_at_path(path: str, item: dict):
+    """Like append_history_snapshot but takes a raw path — used for the
+    closed-position marker, which writes into an existing per-position
+    history file identified by the SAME naming scheme. Caller must
+    already hold _history_lock."""
+    history = _read_json_locked(path, [])
+    history.append(item)
+    _write_json_locked_nolock(path, history)
+
 
 def _snapshot_loop():
     while True:
@@ -437,6 +517,12 @@ _snapshot_thread.start()
 
 
 _RANGE_TO_SECONDS = {"7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400, "all": None}
+
+# Must match exactly the protocol_name strings used as the first element
+# of the tuples in check_out_of_range_alerts()'s `protocols` list —
+# "maxfi".capitalize() gives "Maxfi", not "MaxFi", so this can't be
+# derived automatically without risking a silent mismatch.
+_PROTOCOL_DISPLAY_NAME = {"snuggle": "Snuggle", "maxfi": "MaxFi"}
 
 
 @app.route("/api/<protocol>/history")
@@ -473,6 +559,15 @@ def api_position_history(protocol, token_id):
         history = [s for s in history if s["ts"] >= cutoff]
 
     return jsonify({"snapshots": history, "range": range_key, "token_id": token_id})
+
+
+@app.route("/api/<protocol>/closed")
+def api_closed_positions(protocol):
+    if protocol not in ("snuggle", "maxfi"):
+        return jsonify({"error": "Unknown protocol"}), 404
+    closed = _read_json_locked(_closed_positions_file_path(protocol), [])
+    closed_sorted = sorted(closed, key=lambda c: c["closed_at"], reverse=True)
+    return jsonify({"closed": closed_sorted})
 
 
 if __name__ == "__main__":
