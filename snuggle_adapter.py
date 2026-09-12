@@ -276,6 +276,9 @@ def fetch_snuggle_positions(wallet: str, w3, vault_address: str = VAULT_ADDRESS,
 
         amount0 = None
         amount1 = None
+        current_price = None
+        price_lower = None
+        price_upper = None
         live_tick_lower = tick_lower
         live_tick_upper = tick_upper
         try:
@@ -294,8 +297,17 @@ def fetch_snuggle_positions(wallet: str, w3, vault_address: str = VAULT_ADDRESS,
             )
             amount0 = amt0_raw / (10 ** dec0)
             amount1 = amt1_raw / (10 ** dec1)
+
+            # Human-readable price, quoted as token1 per token0 (standard
+            # Uniswap V3 convention), decimal-adjusted. E.g. for a
+            # WETH(0)/USDC(1) pool this gives USDC per WETH — matches
+            # what lptracker.info shows on its price-range bar.
+            decimal_adjustment = 10 ** (dec0 - dec1)
+            current_price = (sqrt_price ** 2) * decimal_adjustment
+            price_lower = (sqrt_lower ** 2) * decimal_adjustment
+            price_upper = (sqrt_upper ** 2) * decimal_adjustment
         except Exception:
-            pass  # leave amount0/amount1 as None — caller shows "unavailable"
+            pass  # leave amount0/amount1/prices as None — caller shows "unavailable"
 
         in_range = out_of_range_since == 0
 
@@ -316,6 +328,9 @@ def fetch_snuggle_positions(wallet: str, w3, vault_address: str = VAULT_ADDRESS,
             "cumulative_rewards_raw": cum_rewards,
             "amount0": amount0,
             "amount1": amount1,
+            "current_price": current_price,
+            "price_lower": price_lower,
+            "price_upper": price_upper,
             "position_adapter": position_adapter,
             "range_width_bps": range_width_bps,
             "deposit_timestamp": deposit_ts,

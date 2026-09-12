@@ -53,6 +53,18 @@
 
   .positions { display: flex; flex-direction: column; gap: 14px; }
   .position-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; }
+  .range-bar-block { margin: 14px 0; }
+  .range-bar-header { display: flex; justify-content: space-between; align-items: baseline; font-family: var(--mono); font-size: 11px; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .range-bar-header .width-val { color: var(--text); }
+  .range-bar-track { position: relative; height: 8px; background: var(--border); border-radius: 4px; margin: 4px 0; }
+  .range-bar-fill { position: absolute; top: 0; height: 100%; border-radius: 4px; background: var(--green-dim); border: 1px solid rgba(45,205,122,0.4); }
+  .position-card.out-range .range-bar-fill { background: rgba(244,84,92,0.10); border-color: rgba(244,84,92,0.35); }
+  .range-bar-marker { position: absolute; top: -4px; width: 2px; height: 16px; background: var(--blue); transform: translateX(-1px); }
+  .range-bar-labels { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 11px; margin-top: 6px; }
+  .range-bar-edge { color: var(--muted); }
+  .range-bar-edge .edge-price { color: var(--text); }
+  .range-bar-edge .edge-away { color: var(--amber); }
+  .range-bar-current { color: var(--blue); text-align: center; }
   .position-card.in-range { border-left: 3px solid var(--green); }
   .position-card.out-range { border-left: 3px solid var(--amber); }
   .pos-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
@@ -66,7 +78,7 @@
   .pos-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin-bottom: 12px; }
   .stat-label { font-family: var(--mono); font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 3px; }
   .stat-value { font-family: var(--mono); font-size: 13px; font-weight: 500; color: var(--text); }
-  .stat-value.dim { color: var(--muted); font-weight: 400; }
+  .stat-value.dim, .dim { color: var(--muted); font-weight: 400; }
 
   .fees-row { display: flex; align-items: center; justify-content: space-between; background: rgba(32,210,200,0.10); border: 1px solid rgba(32,210,208,0.25); border-radius: 8px; padding: 10px 14px; margin-top: 4px; flex-wrap: wrap; gap: 8px; }
   .fees-label { font-family: var(--mono); font-size: 10px; color: #2dd4d0; text-transform: uppercase; letter-spacing: 0.08em; }
@@ -80,6 +92,9 @@
   .portfolio-stat-value { font-family: var(--mono); font-size: 20px; font-weight: 600; color: var(--text); }
   .portfolio-stat-value.accent { color: var(--blue); }
   .portfolio-stat-value.warn { color: var(--amber); }
+  .portfolio-stat-value.pnl-pos, .stat-value.pnl-pos, .pnl-pos { color: var(--green); }
+  .portfolio-stat-value.pnl-neg, .stat-value.pnl-neg, .pnl-neg { color: var(--red); }
+  .pnl-sub { font-family: var(--mono); font-size: 12px; margin-top: 2px; }
 
   .oor-duration { font-family: var(--mono); font-size: 11px; color: var(--amber); margin-top: 2px; }
 
@@ -247,8 +262,79 @@ function fmtDuration(seconds) {
   return (hours / 24).toFixed(1) + 'd';
 }
 
+function fmtAge(depositTimestamp) {
+  if (!depositTimestamp) return null;
+  const openedAt = new Date(depositTimestamp * 1000);
+  const wholeDays = Math.floor((Date.now() - openedAt.getTime()) / 86400000);
+  const relative = wholeDays < 1 ? 'today' : wholeDays === 1 ? '1 day ago' : `${wholeDays} days ago`;
+  const dateStr = openedAt.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  return { relative, dateStr };
+}
+
 function feeTierLabel(feeRaw) {
   return (feeRaw / 10000).toFixed(2) + '%';
+}
+
+function renderRangeBar(p) {
+  const { price_lower: lo, price_upper: hi, current_price: cur } = p;
+  if (lo === null || lo === undefined || hi === null || hi === undefined ||
+      cur === null || cur === undefined || hi <= lo) {
+    return '';
+  }
+  const span = hi - lo;
+  const pad = span * 0.15;
+  const rangeMin = lo - pad;
+  const rangeMax = hi + pad;
+  const pct = (v) => ((v - rangeMin) / (rangeMax - rangeMin)) * 100;
+  const fillLeft = pct(lo);
+  const fillWidth = pct(hi) - pct(lo);
+  const markerLeft = Math.min(100, Math.max(0, pct(cur)));
+
+  const pctLowerLabel = (p.pct_from_lower !== null && p.pct_from_lower !== undefined)
+    ? `${p.pct_from_lower.toFixed(1)}% away` : '';
+  const pctUpperLabel = (p.pct_from_upper !== null && p.pct_from_upper !== undefined)
+    ? `${p.pct_from_upper.toFixed(1)}% away` : '';
+  const widthLabel = fmtPct(p.range_width_pct, 1);
+
+  return `
+    <div class="range-bar-block">
+      <div class="range-bar-header">
+        <span>Price Range</span>
+        <span class="width-val">Width ${widthLabel}</span>
+      </div>
+      <div class="range-bar-track">
+        <div class="range-bar-fill" style="left:${fillLeft}%; width:${fillWidth}%;"></div>
+        <div class="range-bar-marker" style="left:${markerLeft}%;" title="Current price"></div>
+      </div>
+      <div class="range-bar-labels">
+        <div class="range-bar-edge">
+          <div class="edge-price">${fmtPrice(lo)}</div>
+          <div class="edge-away">${pctLowerLabel}</div>
+        </div>
+        <div class="range-bar-current">▲ ${fmtPrice(cur)}</div>
+        <div class="range-bar-edge" style="text-align:right;">
+          <div class="edge-price">${fmtPrice(hi)}</div>
+          <div class="edge-away">${pctUpperLabel}</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function fmtPnl(usd, pct) {
+  if (usd === null || usd === undefined) return null;
+  const cls = usd >= 0 ? 'pnl-pos' : 'pnl-neg';
+  const sign = usd >= 0 ? '+' : '-';
+  const usdStr = sign + '$' + Math.abs(usd).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const pctStr = (pct !== null && pct !== undefined)
+    ? ` (${sign}${Math.abs(pct).toFixed(2)}%)` : '';
+  return { cls, text: usdStr + pctStr };
+}
+
+function fmtPrice(n) {
+  if (n === null || n === undefined) return '—';
+  const decimals = n >= 100 ? 0 : n >= 1 ? 2 : 6;
+  return '$' + Number(n).toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 }
 
 function renderPortfolio(el, portfolio) {
@@ -262,6 +348,10 @@ function renderPortfolio(el, portfolio) {
   const oorNote = portfolio.out_of_range_count > 0
     ? `<div class="portfolio-stat-value warn">${portfolio.out_of_range_count} / ${portfolio.position_count}</div>`
     : `<div class="portfolio-stat-value">0 / ${portfolio.position_count}</div>`;
+  const pnl = fmtPnl(portfolio.total_pnl_usd, portfolio.total_pnl_pct);
+  const pnlBlock = pnl
+    ? `<div class="portfolio-stat-value ${pnl.cls}">${pnl.text}</div>`
+    : `<div class="portfolio-stat-value dim">—</div>`;
 
   el.innerHTML = `
     <div class="portfolio-bar">
@@ -272,6 +362,10 @@ function renderPortfolio(el, portfolio) {
       <div>
         <div class="portfolio-stat-label">Total Fees Earned</div>
         <div class="portfolio-stat-value">${totalFees}</div>
+      </div>
+      <div>
+        <div class="portfolio-stat-label">Total P&L (since tracked)</div>
+        ${pnlBlock}
       </div>
       <div>
         <div class="portfolio-stat-label">Blended Avg APR</div>
@@ -312,9 +406,14 @@ function renderPositions(el, positions, cfg, name) {
     const usdLine = usdValue
       ? `<div class="stat-value" style="margin-top:2px;">${usdValue}</div>`
       : '';
+    const pnl = fmtPnl(p.pnl_usd, p.pnl_pct);
+    const pnlLine = pnl
+      ? `<div class="pnl-sub ${pnl.cls}">${pnl.text}</div>`
+      : '';
 
     const aprLine = fmtPct(p.lifetime_apr_pct, 1);
     const feesUsd = fmtUsd(p.cumulative_fees_usd);
+    const age = fmtAge(p.deposit_timestamp);
 
     return `
       <div class="position-card ${rangeClass}">
@@ -330,11 +429,14 @@ function renderPositions(el, positions, cfg, name) {
           </div>
         </div>
 
+        ${renderRangeBar(p)}
+
         <div class="pos-grid">
           <div>
             <div class="stat-label">Current Holdings</div>
             <div class="stat-value">${holdingsLine}</div>
             ${usdLine}
+            ${pnlLine}
           </div>
           <div>
             <div class="stat-label">Range Width</div>
@@ -348,6 +450,11 @@ function renderPositions(el, positions, cfg, name) {
           <div>
             <div class="stat-label">Lifetime Avg APR</div>
             <div class="stat-value">${aprLine}</div>
+          </div>
+          <div>
+            <div class="stat-label">Position Age</div>
+            <div class="stat-value">${age ? age.relative : '—'}</div>
+            ${age ? `<div class="stat-value dim" style="margin-top:2px;">${age.dateStr}</div>` : ''}
           </div>
         </div>
 

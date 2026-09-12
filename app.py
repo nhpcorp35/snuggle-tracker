@@ -133,10 +133,47 @@ def enrich_with_usd_and_apr(positions: list) -> list:
                 and position_value_usd > 0 and days_held > 0.5):
             lifetime_apr_pct = (cumulative_fees_usd / position_value_usd) * (365.0 / days_held) * 100.0
         p["lifetime_apr_pct"] = lifetime_apr_pct
+        p["days_held"] = days_held
+
+        # Distance from current price to each range edge, as a % of
+        # current price — matches lptracker.info's "X% away" convention
+        # (verified against its own displayed numbers).
+        pct_from_lower = None
+        pct_from_upper = None
+        cp, pl, pu = p.get("current_price"), p.get("price_lower"), p.get("price_upper")
+        if cp and pl is not None and pu is not None and cp > 0:
+            pct_from_lower = (cp - pl) / cp * 100.0
+            pct_from_upper = (pu - cp) / cp * 100.0
+        p["pct_from_lower"] = pct_from_lower
+        p["pct_from_upper"] = pct_from_upper
 
         # Out-of-range duration, in seconds. 0 means currently in range.
         p["out_of_range_seconds"] = (now - p["out_of_range_since"]) if p["out_of_range_since"] > 0 else 0
 
+    return positions
+
+
+def attach_pnl(positions: list, protocol_name: str) -> list:
+    """Attaches pnl_usd/pnl_pct to each position, relative to the
+    baseline recorded in known_<protocol>.json by the background
+    snapshot loop. Read-only — this file's writer is capture_snapshot()
+    exclusively, to avoid two code paths racing on the same file.
+    Positions with no recorded baseline (brand new, or fetched under a
+    non-default wallet the snapshot loop doesn't track) get None —
+    never a fabricated number."""
+    known = _read_json_locked(_known_positions_file_path(protocol_name), {})
+    for p in positions:
+        entry = known.get(str(p["token_id"]))
+        baseline = entry.get("baseline_value_usd") if entry else None
+        pnl_usd = None
+        pnl_pct = None
+        if (baseline is not None and baseline > 0
+                and p["position_value_usd"] is not None):
+            pnl_usd = p["position_value_usd"] - baseline
+            pnl_pct = pnl_usd / baseline * 100.0
+        p["baseline_value_usd"] = baseline
+        p["pnl_usd"] = pnl_usd
+        p["pnl_pct"] = pnl_pct
     return positions
 
 
@@ -155,12 +192,23 @@ def compute_portfolio_summary(positions: list) -> dict:
             weight_total += p["position_value_usd"]
     blended_apr_pct = (weighted_apr_sum / weight_total) if weight_total > 0 else None
 
+    # Total P&L: sum of pnl_usd across positions that have a baseline.
+    # total_pnl_pct is baseline-weighted (total pnl / total baseline),
+    # not an average of each position's %, so a large position doesn't
+    # get diluted by a small one's noisy percentage.
+    pnl_positions = [p for p in positions if p.get("pnl_usd") is not None]
+    total_pnl_usd = sum(p["pnl_usd"] for p in pnl_positions) if pnl_positions else None
+    total_baseline_usd = sum(p["baseline_value_usd"] for p in pnl_positions) if pnl_positions else 0
+    total_pnl_pct = (total_pnl_usd / total_baseline_usd * 100.0) if total_pnl_usd is not None and total_baseline_usd > 0 else None
+
     return {
         "total_value_usd": total_value_usd if total_value_usd > 0 else None,
         "total_fees_usd": total_fees_usd if total_fees_usd > 0 else None,
         "blended_apr_pct": blended_apr_pct,
         "position_count": len(positions),
         "out_of_range_count": sum(1 for p in positions if not p["in_range"]),
+        "total_pnl_usd": total_pnl_usd,
+        "total_pnl_pct": total_pnl_pct,
     }
 
 
@@ -194,6 +242,7 @@ def _handle_positions_request(cache_prefix: str, vault_address: str, view_helper
     try:
         positions = fetch_snuggle_positions(wallet, w3, vault_address, view_helper_address)
         positions = enrich_with_usd_and_apr(positions)
+        positions = attach_pnl(positions, cache_prefix)
     except Exception as e:
         app.logger.error("%s fetch failed for %s: %s", cache_prefix, wallet, e)
         stale = _stale_cache.get(cache_key)
@@ -481,13 +530,30 @@ def capture_snapshot(protocol_name: str, wallet: str, vault_address: str, view_h
 
         # Rebuild the known set from current positions (drops closed ones,
         # adds new ones, refreshes last_value_usd/last_seen for the rest).
+        #
+        # baseline_value_usd/baseline_ts: a "P&L since we started tracking"
+        # marker, NOT true lifetime cost basis (we have no historical
+        # deposit-time price data). Set once per token_id and carried
+        # forward untouched after that. Self-healing: any tid missing a
+        # baseline — a brand-new discovery, OR one of the positions that
+        # was already open before this feature existed — just gets
+        # baselined at its current value on whichever cycle first sees
+        # it with a valid position_value_usd. No migration step needed.
         new_known = {}
         for tid in current_ids:
             p = current_by_id[tid]
+            prior = known.get(tid, {})
+            baseline_value_usd = prior.get("baseline_value_usd")
+            baseline_ts = prior.get("baseline_ts")
+            if baseline_value_usd is None and p["position_value_usd"] is not None:
+                baseline_value_usd = p["position_value_usd"]
+                baseline_ts = now
             new_known[tid] = {
                 "pool": f"{p['token0']['symbol']}/{p['token1']['symbol']}",
                 "last_value_usd": p["position_value_usd"],
                 "last_seen": now,
+                "baseline_value_usd": baseline_value_usd,
+                "baseline_ts": baseline_ts,
             }
         _write_json_locked_nolock(known_path, new_known)
 
