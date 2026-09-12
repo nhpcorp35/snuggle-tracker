@@ -395,8 +395,9 @@ def capture_snapshot(protocol_name: str, wallet: str, vault_address: str, view_h
         app.logger.warning("Snapshot capture (%s) failed: %s", protocol_name, e)
         return
 
+    now = time.time()
     snapshot = {
-        "ts": time.time(),
+        "ts": now,
         "total_value_usd": portfolio["total_value_usd"],
         "total_fees_usd": portfolio["total_fees_usd"],
         "blended_apr_pct": portfolio["blended_apr_pct"],
@@ -404,6 +405,21 @@ def capture_snapshot(protocol_name: str, wallet: str, vault_address: str, view_h
         "out_of_range_count": portfolio["out_of_range_count"],
     }
     append_history_snapshot(protocol_name, snapshot)
+
+    # Per-position history — one file per (protocol, token_id), same
+    # pattern as the portfolio-level file, so the same load/filter/lock
+    # logic works for both without new code paths.
+    for p in positions:
+        pos_snapshot = {
+            "ts": now,
+            "token_id": p["token_id"],
+            "pool": f"{p['token0']['symbol']}/{p['token1']['symbol']}",
+            "value_usd": p["position_value_usd"],
+            "fees_usd": p["cumulative_fees_usd"],
+            "apr_pct": p["lifetime_apr_pct"],
+            "in_range": p["in_range"],
+        }
+        append_history_snapshot(f"{protocol_name}_pos_{p['token_id']}", pos_snapshot)
 
 
 def _snapshot_loop():
@@ -439,6 +455,24 @@ def api_history(protocol):
         history = [s for s in history if s["ts"] >= cutoff]
 
     return jsonify({"snapshots": history, "range": range_key})
+
+
+@app.route("/api/<protocol>/history/<int:token_id>")
+def api_position_history(protocol, token_id):
+    if protocol not in ("snuggle", "maxfi"):
+        return jsonify({"error": "Unknown protocol"}), 404
+
+    range_key = request.args.get("range", "30d")
+    if range_key not in _RANGE_TO_SECONDS:
+        return jsonify({"error": "range must be one of: 7d, 30d, 90d, all"}), 400
+
+    history = load_history(f"{protocol}_pos_{token_id}")
+    window_seconds = _RANGE_TO_SECONDS[range_key]
+    if window_seconds is not None:
+        cutoff = time.time() - window_seconds
+        history = [s for s in history if s["ts"] >= cutoff]
+
+    return jsonify({"snapshots": history, "range": range_key, "token_id": token_id})
 
 
 if __name__ == "__main__":

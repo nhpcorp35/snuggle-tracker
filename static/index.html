@@ -97,6 +97,10 @@
   .range-btn.active { color: var(--blue); border-color: var(--blue); background: var(--blue-dim); }
   .history-chart-wrap { position: relative; height: 220px; }
   .history-empty { font-family: var(--mono); font-size: 12px; color: var(--muted); text-align: center; padding: 40px 0; }
+
+  .pos-history-toggle { font-family: var(--mono); font-size: 11px; color: var(--blue); cursor: pointer; margin-top: 12px; user-select: none; }
+  .pos-history-toggle:hover { opacity: 0.8; }
+  .pos-history-panel { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
 </style>
 </head>
 <body>
@@ -265,7 +269,7 @@ function renderPortfolio(el, portfolio) {
   `;
 }
 
-function renderPositions(el, positions, cfg) {
+function renderPositions(el, positions, cfg, name) {
   if (!positions.length) {
     el.innerHTML = `
       <div class="empty-state">
@@ -282,6 +286,7 @@ function renderPositions(el, positions, cfg) {
     const badgeClass = p.in_range ? 'in' : 'out';
     const badgeText = p.in_range ? 'In Range' : 'Out of Range';
     const oorDuration = fmtDuration(p.out_of_range_seconds);
+    const posKey = `${name}-${p.token_id}`;
 
     const holdingsLine = (p.amount0 !== null && p.amount1 !== null)
       ? `${fmtNum(p.amount0, 6)} ${sym0} + ${fmtNum(p.amount1, 6)} ${sym1}`
@@ -338,6 +343,19 @@ function renderPositions(el, positions, cfg) {
         <div class="toggles">
           <span class="${p.auto_snuggle ? 'toggle-on' : ''}">${cfg.autoToggleLabel}: ${p.auto_snuggle ? 'ON' : 'off'}</span>
           <span class="${p.auto_compound ? 'toggle-on' : ''}">Compound: ${p.auto_compound ? 'ON' : 'off'}</span>
+        </div>
+
+        <div class="pos-history-toggle" onclick="togglePositionHistory('${name}', ${p.token_id})">
+          <span id="pos-history-arrow-${posKey}">▸</span> Position History
+        </div>
+        <div class="pos-history-panel" id="pos-history-panel-${posKey}" style="display:none;">
+          <div class="range-btns" id="pos-history-btns-${posKey}">
+            <button class="range-btn" onclick="setPositionHistoryRange('${name}', ${p.token_id}, '7d', this)">7D</button>
+            <button class="range-btn active" onclick="setPositionHistoryRange('${name}', ${p.token_id}, '30d', this)">30D</button>
+            <button class="range-btn" onclick="setPositionHistoryRange('${name}', ${p.token_id}, '90d', this)">90D</button>
+            <button class="range-btn" onclick="setPositionHistoryRange('${name}', ${p.token_id}, 'all', this)">All</button>
+          </div>
+          <div class="history-chart-wrap" style="height:160px;"><canvas id="pos-history-chart-${posKey}"></canvas></div>
         </div>
       </div>
     `;
@@ -443,6 +461,134 @@ for (const name of Object.keys(PROTOCOLS)) {
   });
 }
 
+const positionChartInstances = {};
+const positionCurrentRange = {};
+const positionPanelOpened = {}; // lazy-load: don't fetch until first expand
+
+function togglePositionHistory(name, tokenId) {
+  const posKey = `${name}-${tokenId}`;
+  const panel = document.getElementById(`pos-history-panel-${posKey}`);
+  const arrow = document.getElementById(`pos-history-arrow-${posKey}`);
+  const isOpen = panel.style.display !== 'none';
+
+  if (isOpen) {
+    panel.style.display = 'none';
+    arrow.textContent = '▸';
+    return;
+  }
+
+  panel.style.display = 'block';
+  arrow.textContent = '▾';
+
+  if (!positionPanelOpened[posKey]) {
+    positionPanelOpened[posKey] = true;
+    positionCurrentRange[posKey] = '30d';
+    loadPositionHistory(name, tokenId, '30d');
+  }
+}
+
+// After a full auto-refresh re-render, positions are recreated from
+// scratch — this re-opens any panel that was expanded before the
+// refresh, at its previously-selected range, so state isn't silently
+// lost every 90s.
+function restoreOpenPositionHistories(name, positions) {
+  for (const p of positions) {
+    const posKey = `${name}-${p.token_id}`;
+    if (!positionPanelOpened[posKey]) continue;
+
+    const panel = document.getElementById(`pos-history-panel-${posKey}`);
+    const arrow = document.getElementById(`pos-history-arrow-${posKey}`);
+    if (!panel) continue; // position no longer present
+
+    panel.style.display = 'block';
+    if (arrow) arrow.textContent = '▾';
+
+    const range = positionCurrentRange[posKey] || '30d';
+    const btnsContainer = document.getElementById(`pos-history-btns-${posKey}`);
+    if (btnsContainer) {
+      btnsContainer.querySelectorAll('.range-btn').forEach(b => {
+        b.classList.toggle('active', b.textContent.trim().toLowerCase() === range.toLowerCase());
+      });
+    }
+    loadPositionHistory(name, p.token_id, range);
+  }
+}
+
+function setPositionHistoryRange(name, tokenId, range, btnEl) {
+  const posKey = `${name}-${tokenId}`;
+  positionCurrentRange[posKey] = range;
+  btnEl.parentElement.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active'));
+  btnEl.classList.add('active');
+  loadPositionHistory(name, tokenId, range);
+}
+
+async function loadPositionHistory(name, tokenId, range) {
+  const posKey = `${name}-${tokenId}`;
+  const canvas = document.getElementById(`pos-history-chart-${posKey}`);
+  try {
+    const res = await fetch(`/api/${name}/history/${tokenId}?range=${range}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Request failed');
+    renderPositionHistoryChart(posKey, canvas, data.snapshots || []);
+  } catch (e) {
+    if (positionChartInstances[posKey]) { positionChartInstances[posKey].destroy(); positionChartInstances[posKey] = null; }
+    canvas.style.display = 'none';
+    const wrap = canvas.parentElement;
+    let msg = wrap.querySelector('.history-empty');
+    if (!msg) { msg = document.createElement('div'); msg.className = 'history-empty'; wrap.appendChild(msg); }
+    msg.textContent = 'History unavailable: ' + e.message;
+  }
+}
+
+function renderPositionHistoryChart(posKey, canvas, snapshots) {
+  const wrap = canvas.parentElement;
+  const existingMsg = wrap.querySelector('.history-empty');
+
+  if (!snapshots.length) {
+    if (positionChartInstances[posKey]) { positionChartInstances[posKey].destroy(); positionChartInstances[posKey] = null; }
+    canvas.style.display = 'none';
+    let msg = existingMsg;
+    if (!msg) { msg = document.createElement('div'); msg.className = 'history-empty'; wrap.appendChild(msg); }
+    msg.textContent = 'No history yet for this position in this range.';
+    return;
+  }
+
+  if (existingMsg) existingMsg.remove();
+  canvas.style.display = 'block';
+
+  const labels = snapshots.map(s => new Date(s.ts * 1000));
+  const values = snapshots.map(s => s.value_usd);
+
+  if (positionChartInstances[posKey]) positionChartInstances[posKey].destroy();
+  positionChartInstances[posKey] = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [{
+        label: 'Position Value (USD)',
+        data: values,
+        borderColor: '#4a9eff',
+        backgroundColor: 'rgba(74,158,255,0.08)',
+        fill: true,
+        tension: 0.25,
+        pointRadius: 0,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { type: 'time', time: { tooltipFormat: 'MMM d, HH:mm' },
+             ticks: { color: '#7a8899', font: { family: 'IBM Plex Mono', size: 9 } },
+             grid: { color: '#1d2330' } },
+        y: { ticks: { color: '#7a8899', font: { family: 'IBM Plex Mono', size: 9 } },
+             grid: { color: '#1d2330' } },
+      },
+      plugins: { legend: { display: false } },
+    },
+  });
+}
+
 async function loadProtocol(name, bust) {
   const cfg = PROTOCOLS[name];
   cfg.statusDot.className = 'status-dot';
@@ -460,7 +606,8 @@ async function loadProtocol(name, bust) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Request failed');
 
-    renderPositions(cfg.positionsContainer, data.positions || [], cfg);
+    renderPositions(cfg.positionsContainer, data.positions || [], cfg, name);
+    restoreOpenPositionHistories(name, data.positions || []);
     renderPortfolio(cfg.portfolioContainer, data.portfolio);
     cfg.statusDot.classList.add('green');
     const cachedNote = data.cached ? (data.stale ? ' (stale — last good fetch)' : ' (cached)') : '';
