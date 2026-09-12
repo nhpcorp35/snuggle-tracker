@@ -13,6 +13,9 @@ against Snuggle's own UI on 4 real positions (Uniswap V3 + PancakeSwap V3)
 | `PASSWORD` | No | If set, enables HTTP Basic Auth on the whole app |
 | `PORT` | Set by Railway | — |
 
+USD pricing uses GeckoTerminal's free, keyless onchain API — no signup,
+no API key, no cost.
+
 ## Local dev
 
 ```bash
@@ -31,6 +34,7 @@ add a custom domain pointing at this service.
 
 ## What it does NOT do yet
 
-- No USD valuation — shows token amounts only (e.g. "85.98 CAKE + 0.000659 WETH"),
-  not a dollar figure.
 - Read-only. No wallet connection, no transaction capability.
+- Lifetime APR is a simple average (fees earned ÷ current value, annualized
+  over days held) — not the same methodology as Snuggle's own "Earnings Rate,"
+  which appears to use a recent-window rate rather than a lifetime average.

@@ -8,6 +8,7 @@ import time
 import base64
 import logging
 
+import requests
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 from web3 import Web3
@@ -56,6 +57,76 @@ _cache = {}
 _stale_cache = {}
 CACHE_TTL = 120
 
+# ── Token price lookup (GeckoTerminal onchain API, by contract address) ────
+# Fully free, keyless — no signup required. Confirmed against
+# GeckoTerminal's public "Keyless Public API" docs.
+_GECKOTERMINAL_TOKEN_PRICE_URL = "https://api.geckoterminal.com/api/v2/simple/networks/base/token_price/{}"
+
+
+def get_token_prices_usd(addresses: list) -> dict:
+    """
+    Returns {lowercase_address: price_usd}. Missing/failed lookups are
+    simply absent from the returned dict — caller treats those as
+    "price unavailable" rather than erroring the whole request.
+
+    Uses GeckoTerminal's free onchain API (no API key needed).
+    """
+    if not addresses:
+        return {}
+    unique = sorted(set(a.lower() for a in addresses))
+    url = _GECKOTERMINAL_TOKEN_PRICE_URL.format(",".join(unique))
+    try:
+        resp = requests.get(url, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        token_prices = data.get("data", {}).get("attributes", {}).get("token_prices", {})
+        return {addr.lower(): float(price) for addr, price in token_prices.items()}
+    except Exception as e:
+        app.logger.warning("GeckoTerminal price fetch failed: %s", e)
+        return {}
+
+
+def enrich_with_usd_and_apr(positions: list) -> list:
+    """Adds range_width_pct, USD values, and a lifetime-average APR
+    estimate to each position. Fields are None where price data or
+    holdings weren't available — never fabricated."""
+    all_addresses = []
+    for p in positions:
+        all_addresses.append(p["token0"]["address"])
+        all_addresses.append(p["token1"]["address"])
+    prices = get_token_prices_usd(all_addresses)
+
+    now = time.time()
+    for p in positions:
+        p["range_width_pct"] = p["range_width_bps"] / 100.0
+
+        price0 = prices.get(p["token0"]["address"].lower())
+        price1 = prices.get(p["token1"]["address"].lower())
+
+        position_value_usd = None
+        if p["amount0"] is not None and p["amount1"] is not None and price0 is not None and price1 is not None:
+            position_value_usd = p["amount0"] * price0 + p["amount1"] * price1
+        p["position_value_usd"] = position_value_usd
+
+        cumulative_fees_usd = None
+        if price0 is not None and price1 is not None:
+            cumulative_fees_usd = p["cumulative_fees0"] * price0 + p["cumulative_fees1"] * price1
+        p["cumulative_fees_usd"] = cumulative_fees_usd
+
+        # Lifetime-average APR: (fees earned / current value) annualized
+        # over days since deposit. This is a lifetime average, NOT the
+        # same methodology as Snuggle's own "Earnings Rate" (which
+        # appears to be a recent-window rate, not lifetime) — labelled
+        # accordingly in the UI to avoid implying it matches exactly.
+        lifetime_apr_pct = None
+        days_held = (now - p["deposit_timestamp"]) / 86400.0
+        if (cumulative_fees_usd is not None and position_value_usd
+                and position_value_usd > 0 and days_held > 0.5):
+            lifetime_apr_pct = (cumulative_fees_usd / position_value_usd) * (365.0 / days_held) * 100.0
+        p["lifetime_apr_pct"] = lifetime_apr_pct
+
+    return positions
+
 
 @app.route("/")
 def index():
@@ -87,6 +158,7 @@ def api_snuggle_positions():
 
     try:
         positions = fetch_snuggle_positions(wallet, w3)
+        positions = enrich_with_usd_and_apr(positions)
     except Exception as e:
         app.logger.error("Snuggle fetch failed for %s: %s", wallet, e)
         stale = _stale_cache.get(cache_key)
