@@ -1,10 +1,14 @@
 """
 snuggle_adapter.py
 
-Fetches Snuggle vault LP positions (Base) directly from on-chain
-contracts. Validated against Snuggle's own UI on 4 real positions
-(2 Uniswap V3, 2 PancakeSwap V3) — all matched exactly or within
-expected drift from ongoing fee compounding.
+Fetches vault LP positions (Base) directly from on-chain contracts,
+for Snuggle itself or any white-labeled deployment of the same
+contract architecture (e.g. MaxFi — confirmed via maxfi.tech's own
+site footer: "Powered by Snuggle").
+
+Validated against Snuggle's own UI on 4 real positions (2 Uniswap V3,
+2 PancakeSwap V3) — all matched exactly or within expected drift from
+ongoing fee compounding.
 
 Self-contained: does its own ERC20 symbol/decimals lookups and
 caching, so this file has no dependency on any other app's helpers.
@@ -12,8 +16,16 @@ caching, so this file has no dependency on any other app's helpers.
 
 from web3 import Web3
 
+# Snuggle's own deployment (default).
 VIEWHELPER_ADDRESS = Web3.to_checksum_address("0x298028007e2aeb04d787c8a8bfa03144cc976a1c")
 VAULT_ADDRESS = Web3.to_checksum_address("0xd3923beccb6e1ddb048ed00a0a9bd602d16b7470")
+
+# MaxFi's separate deployment of the identical contract code (same
+# ABIs, verified against their own security page listing 15 deployed
+# contracts on Base, audited by the same team under the same
+# methodology as Snuggle).
+MAXFI_VIEWHELPER_ADDRESS = Web3.to_checksum_address("0x286490622bcc7261c0ce794b7166dc67d3ce18bd")
+MAXFI_VAULT_ADDRESS = Web3.to_checksum_address("0x7d27cdfbfcc878f7e7349e216d44204bfd2afd55")
 
 VIEWHELPER_ABI = [
     {
@@ -208,25 +220,34 @@ def _amounts_for_liquidity(sqrt_price: float, sqrt_lower: float, sqrt_upper: flo
         return amount0, amount1
 
 
-def _get_pool_config(vault, pool_id: bytes) -> tuple:
-    if pool_id in _pool_cache:
-        return _pool_cache[pool_id]
+def _get_pool_config(vault, vault_address: str, pool_id: bytes) -> tuple:
+    cache_key = (vault_address, pool_id)
+    if cache_key in _pool_cache:
+        return _pool_cache[cache_key]
     cfg = vault.functions.approvedPools(pool_id).call()
-    _pool_cache[pool_id] = cfg
+    _pool_cache[cache_key] = cfg
     return cfg
 
 
-def fetch_snuggle_positions(wallet: str, w3) -> list:
+def fetch_snuggle_positions(wallet: str, w3, vault_address: str = VAULT_ADDRESS,
+                             view_helper_address: str = VIEWHELPER_ADDRESS) -> list:
     """
-    Fetch all Snuggle vault positions for a wallet on Base.
+    Fetch all vault positions for a wallet on Base, for any deployment
+    of this contract architecture (Snuggle itself, or a white-labeled
+    fork like MaxFi — same ABIs, different addresses).
 
-    Returns a list of dicts, one per position — see field comments
-    below. Raises on total failure (e.g. RPC down); caller should
-    wrap in try/except.
+    Defaults to Snuggle's own deployment. Pass vault_address and
+    view_helper_address to point at a different deployment (e.g.
+    MaxFi's contracts).
+
+    Raises on total failure (e.g. RPC down); caller should wrap in
+    try/except.
     """
     wallet = Web3.to_checksum_address(wallet)
-    view_helper = w3.eth.contract(address=VIEWHELPER_ADDRESS, abi=VIEWHELPER_ABI)
-    vault = w3.eth.contract(address=VAULT_ADDRESS, abi=VAULT_ABI)
+    vault_address = Web3.to_checksum_address(vault_address)
+    view_helper_address = Web3.to_checksum_address(view_helper_address)
+    view_helper = w3.eth.contract(address=view_helper_address, abi=VIEWHELPER_ABI)
+    vault = w3.eth.contract(address=vault_address, abi=VAULT_ABI)
 
     token_ids = view_helper.functions.getUserPositions(wallet).call()
     results = []
@@ -241,7 +262,7 @@ def fetch_snuggle_positions(wallet: str, w3) -> list:
             cum_rewards, _reserved,
         ) = pos
 
-        pool_cfg = _get_pool_config(vault, pool_id)
+        pool_cfg = _get_pool_config(vault, vault_address, pool_id)
         (pool_addr, token0_addr, token1_addr, fee, tick_spacing, active,
          position_adapter, reward_adapter) = pool_cfg
 

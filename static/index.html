@@ -80,6 +80,11 @@
   .portfolio-stat-value.warn { color: var(--amber); }
 
   .oor-duration { font-family: var(--mono); font-size: 11px; color: var(--amber); margin-top: 2px; }
+
+  .protocol-section { margin-bottom: 36px; }
+  .protocol-header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .protocol-title { font-family: var(--mono); font-size: 16px; font-weight: 600; color: var(--text); text-transform: uppercase; letter-spacing: 0.08em; }
+  .protocol-status { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -88,37 +93,66 @@
   <div class="logo" style="cursor:default">Snuggle Tracker</div>
   <div style="flex:1"></div>
   <input id="wallet-input" type="text" placeholder="0x... wallet address (leave blank for default)">
-  <button class="btn" id="load-btn" onclick="loadPositions(true)">Load</button>
+  <button class="btn" id="load-btn" onclick="loadAll(true)">Load</button>
 </header>
 
 <main>
-  <div id="status-bar">
-    <span class="status-dot" id="status-dot"></span>
-    <span id="status-text">Loading…</span>
-  </div>
-
   <div class="error-banner" id="error-banner"></div>
 
-  <div id="portfolio-bar-container"></div>
+  <div class="protocol-section">
+    <div class="protocol-header">
+      <span class="protocol-title">Snuggle</span>
+      <span class="status-dot" id="snuggle-status-dot"></span>
+      <span class="protocol-status" id="snuggle-status-text">Loading…</span>
+    </div>
+    <div id="snuggle-portfolio-container"></div>
+    <div class="positions" id="snuggle-positions-container">
+      <div class="empty-state loading-pulse"><div class="icon">◈</div><p>Fetching Snuggle positions…</p></div>
+    </div>
+  </div>
 
-  <div class="positions" id="positions-container">
-    <div class="empty-state loading-pulse">
-      <div class="icon">◈</div>
-      <p>Fetching Snuggle vault positions…</p>
+  <div class="protocol-section">
+    <div class="protocol-header">
+      <span class="protocol-title">MaxFi</span>
+      <span class="status-dot" id="maxfi-status-dot"></span>
+      <span class="protocol-status" id="maxfi-status-text">Loading…</span>
+    </div>
+    <div id="maxfi-portfolio-container"></div>
+    <div class="positions" id="maxfi-positions-container">
+      <div class="empty-state loading-pulse"><div class="icon">◈</div><p>Fetching MaxFi positions…</p></div>
     </div>
   </div>
 </main>
 
 <script>
-const container = document.getElementById('positions-container');
-const portfolioContainer = document.getElementById('portfolio-bar-container');
-const statusDot = document.getElementById('status-dot');
-const statusText = document.getElementById('status-text');
 const errorBanner = document.getElementById('error-banner');
 const loadBtn = document.getElementById('load-btn');
 
 const AUTO_REFRESH_MS = 90000; // 90s — aligned with the backend's 120s cache TTL
 let autoRefreshTimer = null;
+
+// Both protocols use identical response shape and card layout — this
+// name → element mapping is all that differs between them.
+const PROTOCOLS = {
+  snuggle: {
+    endpoint: '/api/snuggle/positions',
+    statusDot: document.getElementById('snuggle-status-dot'),
+    statusText: document.getElementById('snuggle-status-text'),
+    portfolioContainer: document.getElementById('snuggle-portfolio-container'),
+    positionsContainer: document.getElementById('snuggle-positions-container'),
+    emptyLabel: 'Snuggle',
+    autoToggleLabel: 'Auto-Snuggle',
+  },
+  maxfi: {
+    endpoint: '/api/maxfi/positions',
+    statusDot: document.getElementById('maxfi-status-dot'),
+    statusText: document.getElementById('maxfi-status-text'),
+    portfolioContainer: document.getElementById('maxfi-portfolio-container'),
+    positionsContainer: document.getElementById('maxfi-positions-container'),
+    emptyLabel: 'MaxFi',
+    autoToggleLabel: 'Auto-Rebalance',
+  },
+};
 
 function fmtNum(n, decimals) {
   if (n === null || n === undefined) return '—';
@@ -147,9 +181,9 @@ function feeTierLabel(feeRaw) {
   return (feeRaw / 10000).toFixed(2) + '%';
 }
 
-function renderPortfolio(portfolio) {
+function renderPortfolio(el, portfolio) {
   if (!portfolio || portfolio.position_count === 0) {
-    portfolioContainer.innerHTML = '';
+    el.innerHTML = '';
     return;
   }
   const totalValue = fmtUsd(portfolio.total_value_usd) || '—';
@@ -159,7 +193,7 @@ function renderPortfolio(portfolio) {
     ? `<div class="portfolio-stat-value warn">${portfolio.out_of_range_count} / ${portfolio.position_count}</div>`
     : `<div class="portfolio-stat-value">0 / ${portfolio.position_count}</div>`;
 
-  portfolioContainer.innerHTML = `
+  el.innerHTML = `
     <div class="portfolio-bar">
       <div>
         <div class="portfolio-stat-label">Total Value</div>
@@ -181,17 +215,17 @@ function renderPortfolio(portfolio) {
   `;
 }
 
-function renderPositions(positions) {
+function renderPositions(el, positions, cfg) {
   if (!positions.length) {
-    container.innerHTML = `
+    el.innerHTML = `
       <div class="empty-state">
         <div class="icon">◈</div>
-        <p>No Snuggle positions found for this wallet.</p>
+        <p>No ${cfg.emptyLabel} positions found for this wallet.</p>
       </div>`;
     return;
   }
 
-  container.innerHTML = positions.map(p => {
+  el.innerHTML = positions.map(p => {
     const sym0 = p.token0.symbol;
     const sym1 = p.token1.symbol;
     const rangeClass = p.in_range ? 'in-range' : 'out-range';
@@ -252,7 +286,7 @@ function renderPositions(positions) {
         </div>
 
         <div class="toggles">
-          <span class="${p.auto_snuggle ? 'toggle-on' : ''}">Auto-Snuggle: ${p.auto_snuggle ? 'ON' : 'off'}</span>
+          <span class="${p.auto_snuggle ? 'toggle-on' : ''}">${cfg.autoToggleLabel}: ${p.auto_snuggle ? 'ON' : 'off'}</span>
           <span class="${p.auto_compound ? 'toggle-on' : ''}">Compound: ${p.auto_compound ? 'ON' : 'off'}</span>
         </div>
       </div>
@@ -260,14 +294,13 @@ function renderPositions(positions) {
   }).join('');
 }
 
-async function loadPositions(bust) {
-  loadBtn.disabled = true;
-  errorBanner.classList.remove('visible');
-  statusDot.className = 'status-dot';
-  statusText.textContent = 'Loading…';
+async function loadProtocol(name, bust) {
+  const cfg = PROTOCOLS[name];
+  cfg.statusDot.className = 'status-dot';
+  cfg.statusText.textContent = 'Loading…';
 
   const wallet = document.getElementById('wallet-input').value.trim();
-  let url = '/api/snuggle/positions';
+  let url = cfg.endpoint;
   const params = [];
   if (wallet) params.push('wallet=' + encodeURIComponent(wallet));
   if (bust) params.push('bust=1');
@@ -276,33 +309,42 @@ async function loadPositions(bust) {
   try {
     const res = await fetch(url);
     const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Request failed');
 
-    if (!res.ok) {
-      throw new Error(data.error || 'Request failed');
-    }
-
-    renderPositions(data.positions || []);
-    renderPortfolio(data.portfolio);
-    statusDot.classList.add('green');
+    renderPositions(cfg.positionsContainer, data.positions || [], cfg);
+    renderPortfolio(cfg.portfolioContainer, data.portfolio);
+    cfg.statusDot.classList.add('green');
     const cachedNote = data.cached ? (data.stale ? ' (stale — last good fetch)' : ' (cached)') : '';
-    statusText.textContent = `${data.positions.length} position(s) · fetched ${new Date(data.fetched_at * 1000).toLocaleTimeString()}${cachedNote}`;
+    cfg.statusText.textContent = `${data.positions.length} position(s) · fetched ${new Date(data.fetched_at * 1000).toLocaleTimeString()}${cachedNote}`;
+    return null; // no error
   } catch (e) {
-    errorBanner.textContent = 'Error: ' + e.message;
-    errorBanner.classList.add('visible');
-    statusText.textContent = 'Failed to load';
-    container.innerHTML = '';
-    portfolioContainer.innerHTML = '';
-  } finally {
-    loadBtn.disabled = false;
+    cfg.statusText.textContent = 'Failed to load';
+    cfg.positionsContainer.innerHTML = '';
+    cfg.portfolioContainer.innerHTML = '';
+    return `${name}: ${e.message}`;
   }
+}
+
+async function loadAll(bust) {
+  loadBtn.disabled = true;
+  errorBanner.classList.remove('visible');
+
+  const errors = (await Promise.all([loadProtocol('snuggle', bust), loadProtocol('maxfi', bust)]))
+    .filter(Boolean);
+
+  if (errors.length) {
+    errorBanner.textContent = 'Error: ' + errors.join(' | ');
+    errorBanner.classList.add('visible');
+  }
+  loadBtn.disabled = false;
 }
 
 function resetAutoRefresh() {
   if (autoRefreshTimer) clearInterval(autoRefreshTimer);
-  autoRefreshTimer = setInterval(() => loadPositions(false), AUTO_REFRESH_MS);
+  autoRefreshTimer = setInterval(() => loadAll(false), AUTO_REFRESH_MS);
 }
 
-loadPositions(false);
+loadAll(false);
 resetAutoRefresh();
 </script>
 

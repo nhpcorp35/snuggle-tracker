@@ -15,7 +15,11 @@ from flask_cors import CORS
 from web3 import Web3
 from dotenv import load_dotenv
 
-from snuggle_adapter import fetch_snuggle_positions
+from snuggle_adapter import (
+    fetch_snuggle_positions,
+    VAULT_ADDRESS, VIEWHELPER_ADDRESS,
+    MAXFI_VAULT_ADDRESS, MAXFI_VIEWHELPER_ADDRESS,
+)
 
 load_dotenv()
 
@@ -44,6 +48,8 @@ def require_auth():
 # ── RPC setup ─────────────────────────────────────────────────────────────
 ALCHEMY_BASE = os.environ.get("ALCHEMY_BASE", "")
 DEFAULT_WALLET = os.environ.get("DEFAULT_WALLET", "").strip()
+# Falls back to DEFAULT_WALLET if you use the same wallet for both protocols.
+DEFAULT_WALLET_MAXFI = os.environ.get("DEFAULT_WALLET_MAXFI", "").strip() or DEFAULT_WALLET
 
 _w3 = None
 
@@ -161,19 +167,18 @@ def index():
     return app.send_static_file("index.html")
 
 
-@app.route("/api/snuggle/positions")
-def api_snuggle_positions():
-    """
-    GET /api/snuggle/positions?wallet=0x...
-    If wallet is omitted, uses DEFAULT_WALLET env var.
-    """
-    wallet = request.args.get("wallet", "").strip() or DEFAULT_WALLET
+def _handle_positions_request(cache_prefix: str, vault_address: str, view_helper_address: str,
+                               default_wallet: str):
+    """Shared logic for both /api/snuggle/positions and /api/maxfi/positions —
+    same caching, error-handling, and enrichment, just pointed at different
+    contract addresses."""
+    wallet = request.args.get("wallet", "").strip() or default_wallet
     if not wallet:
-        return jsonify({"error": "No wallet specified and no DEFAULT_WALLET configured"}), 400
+        return jsonify({"error": f"No wallet specified and no default wallet configured for {cache_prefix}"}), 400
     if not wallet.startswith("0x") or len(wallet) != 42:
         return jsonify({"error": "Invalid wallet address"}), 400
 
-    cache_key = wallet.lower()
+    cache_key = f"{cache_prefix}:{wallet.lower()}"
     bust = request.args.get("bust", "0") == "1"
     cached = _cache.get(cache_key)
     if not bust and cached and time.time() - cached["fetched_at"] < CACHE_TTL:
@@ -185,13 +190,13 @@ def api_snuggle_positions():
         return jsonify({"error": "ALCHEMY_BASE RPC not configured"}), 500
 
     try:
-        positions = fetch_snuggle_positions(wallet, w3)
+        positions = fetch_snuggle_positions(wallet, w3, vault_address, view_helper_address)
         positions = enrich_with_usd_and_apr(positions)
     except Exception as e:
-        app.logger.error("Snuggle fetch failed for %s: %s", wallet, e)
+        app.logger.error("%s fetch failed for %s: %s", cache_prefix, wallet, e)
         stale = _stale_cache.get(cache_key)
         if stale:
-            app.logger.warning("Serving stale data for %s", wallet)
+            app.logger.warning("Serving stale %s data for %s", cache_prefix, wallet)
             return jsonify({"positions": stale["positions"], "portfolio": stale["portfolio"],
                             "cached": True, "stale": True, "fetched_at": stale["fetched_at"]})
         return jsonify({"error": str(e)}), 500
@@ -202,6 +207,20 @@ def api_snuggle_positions():
     _stale_cache[cache_key] = result
     return jsonify({"positions": positions, "portfolio": portfolio, "cached": False,
                     "fetched_at": result["fetched_at"]})
+
+
+@app.route("/api/snuggle/positions")
+def api_snuggle_positions():
+    """GET /api/snuggle/positions?wallet=0x... — Snuggle's own deployment."""
+    return _handle_positions_request("snuggle", VAULT_ADDRESS, VIEWHELPER_ADDRESS, DEFAULT_WALLET)
+
+
+@app.route("/api/maxfi/positions")
+def api_maxfi_positions():
+    """GET /api/maxfi/positions?wallet=0x... — MaxFi's separate deployment
+    of the same contract architecture (confirmed: maxfi.tech is
+    white-labeled Snuggle, "Powered by Snuggle" in their own footer)."""
+    return _handle_positions_request("maxfi", MAXFI_VAULT_ADDRESS, MAXFI_VIEWHELPER_ADDRESS, DEFAULT_WALLET_MAXFI)
 
 
 @app.route("/api/health")
@@ -237,37 +256,49 @@ def send_pushover(title: str, message: str):
 
 
 def check_out_of_range_alerts():
-    """Runs in a background thread. Checks DEFAULT_WALLET's positions
-    and fires a Pushover alert for any position freshly crossing the
-    out-of-range threshold."""
-    if not DEFAULT_WALLET or not PUSHOVER_TOKEN or not PUSHOVER_USER:
-        return  # nothing to check / nowhere to send — stay quiet, don't spam logs on every poll
+    """Runs in a background thread. Checks both Snuggle's and MaxFi's
+    positions and fires a Pushover alert for any position freshly
+    crossing the out-of-range threshold."""
+    if not PUSHOVER_TOKEN or not PUSHOVER_USER:
+        return  # nowhere to send — stay quiet, don't spam logs on every poll
     w3 = get_w3()
     if not w3:
         return
-    try:
-        positions = fetch_snuggle_positions(DEFAULT_WALLET, w3)
-    except Exception as e:
-        app.logger.warning("Alert check: fetch failed: %s", e)
-        return
 
     threshold_seconds = OUT_OF_RANGE_ALERT_HOURS * 3600
-    for p in positions:
-        oor_since = p["out_of_range_since"]
-        token_id = p["token_id"]
-        if oor_since == 0:
-            _alerted_episodes.pop(token_id, None)  # back in range — reset for next episode
+
+    protocols = [
+        ("Snuggle", DEFAULT_WALLET, VAULT_ADDRESS, VIEWHELPER_ADDRESS),
+        ("MaxFi", DEFAULT_WALLET_MAXFI, MAXFI_VAULT_ADDRESS, MAXFI_VIEWHELPER_ADDRESS),
+    ]
+
+    for protocol_name, wallet, vault_address, view_helper_address in protocols:
+        if not wallet:
             continue
-        duration = time.time() - oor_since
-        if duration >= threshold_seconds and _alerted_episodes.get(token_id) != oor_since:
-            sym0, sym1 = p["token0"]["symbol"], p["token1"]["symbol"]
-            hours = duration / 3600
-            send_pushover(
-                "Snuggle position stuck out of range",
-                f"{sym0}/{sym1} #{token_id} has been out of range for {hours:.1f}h. "
-                f"Check if auto-Snuggle/keeper is functioning.",
-            )
-            _alerted_episodes[token_id] = oor_since
+        try:
+            positions = fetch_snuggle_positions(wallet, w3, vault_address, view_helper_address)
+        except Exception as e:
+            app.logger.warning("Alert check (%s): fetch failed: %s", protocol_name, e)
+            continue
+
+        for p in positions:
+            oor_since = p["out_of_range_since"]
+            # Episode key includes protocol so Snuggle and MaxFi token IDs
+            # (which can collide as plain integers) never clash.
+            episode_key = (protocol_name, p["token_id"])
+            if oor_since == 0:
+                _alerted_episodes.pop(episode_key, None)  # back in range — reset for next episode
+                continue
+            duration = time.time() - oor_since
+            if duration >= threshold_seconds and _alerted_episodes.get(episode_key) != oor_since:
+                sym0, sym1 = p["token0"]["symbol"], p["token1"]["symbol"]
+                hours = duration / 3600
+                send_pushover(
+                    f"{protocol_name} position stuck out of range",
+                    f"{sym0}/{sym1} #{p['token_id']} has been out of range for {hours:.1f}h. "
+                    f"Check if auto-rebalance/keeper is functioning.",
+                )
+                _alerted_episodes[episode_key] = oor_since
 
 
 def _alert_polling_loop():
