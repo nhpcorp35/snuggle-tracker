@@ -13,31 +13,7 @@ DEFAULT_WALLET = os.environ.get("DEFAULT_WALLET", "").strip()
 w3 = Web3(Web3.HTTPProvider(ALCHEMY_BASE))
 print(f"Connected: {w3.is_connected()}, block {w3.eth.block_number}")
 
-APPROVED_POOLS_AND_POSITIONS_ABI = sa.VAULT_ABI + [
-    {
-        "inputs": [{"internalType": "bytes32", "name": "poolId", "type": "bytes32"}],
-        "name": "approvedPools",
-        "outputs": [
-            {
-                "components": [
-                    {"internalType": "address", "name": "pool", "type": "address"},
-                    {"internalType": "address", "name": "token0", "type": "address"},
-                    {"internalType": "address", "name": "token1", "type": "address"},
-                    {"internalType": "uint24", "name": "fee", "type": "uint24"},
-                    {"internalType": "int24", "name": "tickSpacing", "type": "int24"},
-                    {"internalType": "bool", "name": "active", "type": "bool"},
-                    {"internalType": "address", "name": "positionAdapter", "type": "address"},
-                    {"internalType": "address", "name": "rewardAdapter", "type": "address"},
-                ],
-                "internalType": "struct ISnuggleVault.PoolConfig",
-                "name": "",
-                "type": "tuple",
-            }
-        ],
-        "stateMutability": "view",
-        "type": "function",
-    },
-]
+APPROVED_POOLS_AND_POSITIONS_ABI = sa.VAULT_ABI  # approvedPools() is already in here
 
 for label, viewhelper, vault in [
     ("Snuggle", sa.VIEWHELPER_ADDRESS, sa.VAULT_ADDRESS),
