@@ -91,3 +91,18 @@ for label, viewhelper, vault in [
                     print(f"  {fn_name}(tokenId={tid}) -> {Web3.to_checksum_address(addr)}")
             except Exception:
                 pass
+
+        # Hypothesis: this custom adapter wraps Pancake's MasterChefV3
+        # directly (all reward-bearing positions found so far are
+        # Pancake pools; Uniswap V3 pools show a zero reward adapter).
+        # Verify by comparing values directly rather than guessing.
+        MASTERCHEF_ABI = [{"inputs": [{"internalType": "uint256", "name": "_tokenId", "type": "uint256"}],
+            "name": "pendingCake", "outputs": [{"internalType": "uint256", "name": "reward", "type": "uint256"}],
+            "stateMutability": "view", "type": "function"}]
+        PANCAKE_MASTERCHEF_V3 = Web3.to_checksum_address("0xC6A2Db661D5a5690172d8eB0a7DEA2d3008665A3")
+        try:
+            mc = w3.eth.contract(address=PANCAKE_MASTERCHEF_V3, abi=MASTERCHEF_ABI)
+            mc_pending = mc.functions.pendingCake(tid).call()
+            print(f"  MasterChefV3.pendingCake(tokenId={tid}) = {mc_pending} (compare to pendingRewards above)")
+        except Exception as e:
+            print(f"  MasterChefV3.pendingCake() failed: {e}")
