@@ -142,6 +142,8 @@ def enrich_with_usd_and_apr(positions: list) -> list:
     for p in positions:
         all_addresses.append(p["token0"]["address"])
         all_addresses.append(p["token1"]["address"])
+        if p.get("reward_token_address"):
+            all_addresses.append(p["reward_token_address"])
     prices = get_token_prices_usd(all_addresses)
 
     now = time.time()
@@ -160,6 +162,13 @@ def enrich_with_usd_and_apr(positions: list) -> list:
         if price0 is not None and price1 is not None:
             cumulative_fees_usd = p["cumulative_fees0"] * price0 + p["cumulative_fees1"] * price1
         p["cumulative_fees_usd"] = cumulative_fees_usd
+
+        pending_reward_usd = None
+        if p.get("pending_reward") is not None and p.get("reward_token_address"):
+            reward_price = prices.get(p["reward_token_address"].lower())
+            if reward_price is not None:
+                pending_reward_usd = p["pending_reward"] * reward_price
+        p["pending_reward_usd"] = pending_reward_usd
 
         # Lifetime-average APR: (fees earned / current value) annualized
         # over days since deposit. This is a lifetime average, NOT the

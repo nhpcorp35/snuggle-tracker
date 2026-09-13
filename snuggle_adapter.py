@@ -112,6 +112,33 @@ ADAPTER_ABI = [
     },
 ]
 
+# rewardAdapter — found via direct on-chain probing, not any published
+# interface (this is a private Snuggle contract, unindexed by search).
+# pendingRewards(tokenId) confirmed to work and return live amounts for
+# real positions. The reward TOKEN itself couldn't be confirmed the
+# same direct way — tried ~25 candidate getter names (rewardToken(),
+# CAKE(), asset(), etc., both bare and tokenId-parameterized), none
+# hit. Inferred as CAKE instead, from strong circumstantial evidence:
+# every reward-bearing position found is a PancakeSwap pool (Uniswap V3
+# pools show a zero reward adapter), and this adapter's own
+# pendingRewards() value is the same order of magnitude as calling
+# PancakeSwap's MasterChefV3.pendingCake() directly on the same
+# tokenId (not identical — Snuggle likely nets its own fee/timing logic
+# on top — but consistent with the same underlying token). If a future
+# Aerodrome-backed Snuggle pool ever gets a reward adapter, this
+# assumption would need re-checking — it does NOT generalize to AERO.
+CAKE_TOKEN_BASE = Web3.to_checksum_address("0x3055913c90Fcc1a6CE9a358911721eEb942013A1")
+
+REWARD_ADAPTER_ABI = [
+    {
+        "inputs": [{"internalType": "uint256", "name": "tokenId", "type": "uint256"}],
+        "name": "pendingRewards",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
 # Standard Uniswap V3 pool slot0() — feeProtocol as uint8.
 UNISWAP_POOL_ABI = [
     {
@@ -309,6 +336,22 @@ def fetch_snuggle_positions(wallet: str, w3, vault_address: str = VAULT_ADDRESS,
         except Exception:
             pass  # leave amount0/amount1/prices as None — caller shows "unavailable"
 
+        pending_reward = None
+        reward_token_symbol = None
+        reward_token_address = None
+        if reward_adapter != "0x0000000000000000000000000000000000000000":
+            try:
+                reward_contract = w3.eth.contract(
+                    address=Web3.to_checksum_address(reward_adapter), abi=REWARD_ADAPTER_ABI
+                )
+                pending_raw = reward_contract.functions.pendingRewards(token_id).call()
+                reward_token_address = CAKE_TOKEN_BASE  # see CAKE_TOKEN_BASE comment above
+                reward_token_symbol = _token_symbol(w3, reward_token_address)
+                reward_dec = _token_decimals(w3, reward_token_address)
+                pending_reward = pending_raw / (10 ** reward_dec)
+            except Exception:
+                pass  # leave reward fields as None rather than guess
+
         in_range = out_of_range_since == 0
 
         results.append({
@@ -326,6 +369,10 @@ def fetch_snuggle_positions(wallet: str, w3, vault_address: str = VAULT_ADDRESS,
             "cumulative_fees0": cum_fees0_readable,
             "cumulative_fees1": cum_fees1_readable,
             "cumulative_rewards_raw": cum_rewards,
+            "is_staked": reward_adapter != "0x0000000000000000000000000000000000000000",
+            "reward_token_address": reward_token_address,
+            "reward_token_symbol": reward_token_symbol,
+            "pending_reward": pending_reward,
             "amount0": amount0,
             "amount1": amount1,
             "current_price": current_price,
