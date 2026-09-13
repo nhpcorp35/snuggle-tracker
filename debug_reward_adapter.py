@@ -68,3 +68,26 @@ for label, viewhelper, vault in [
                 print(f"  {fn_name}(tokenId={tid}) -> raw {len(raw)} bytes: {raw.hex()}")
             except Exception:
                 pass
+
+        # Found pendingRewards(tokenId) works — now find the reward
+        # TOKEN address. Try both no-arg (fixed per adapter instance)
+        # and tokenId-arg (per-pool, since one adapter might serve
+        # multiple pools with different reward tokens) variants.
+        for fn_name in ["rewardToken", "REWARD", "getToken", "rewardTokenAddress", "token0", "token1"]:
+            selector = Web3.keccak(text=f"{fn_name}()")[:4]
+            try:
+                raw = w3.eth.call({"to": reward_adapter, "data": selector})
+                if len(raw) == 32:
+                    addr = "0x" + raw[-20:].hex()
+                    print(f"  {fn_name}() -> {Web3.to_checksum_address(addr)}")
+            except Exception:
+                pass
+        for fn_name in ["rewardToken", "getRewardToken", "token"]:
+            selector = Web3.keccak(text=f"{fn_name}(uint256)")[:4]
+            try:
+                raw = w3.eth.call({"to": reward_adapter, "data": selector + encoded_tid})
+                if len(raw) == 32:
+                    addr = "0x" + raw[-20:].hex()
+                    print(f"  {fn_name}(tokenId={tid}) -> {Web3.to_checksum_address(addr)}")
+            except Exception:
+                pass
