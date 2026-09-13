@@ -42,12 +42,29 @@ for label, viewhelper, vault in [
         code_len = len(w3.eth.get_code(reward_adapter))
         print(f"  rewardAdapter bytecode: {code_len} bytes")
 
-        for fn_name in ["rewardToken", "REWARD_TOKEN", "token", "cakeToken", "CAKE"]:
+        for fn_name in ["rewardToken", "REWARD_TOKEN", "token", "cakeToken", "CAKE",
+                        "getRewardToken", "rewardsToken", "REWARDS_TOKEN", "incentiveToken",
+                        "emissionToken", "rewardCoin", "payoutToken", "distributionToken",
+                        "farmToken", "stakingToken", "want", "asset", "underlying",
+                        "rewardAsset", "outputToken"]:
             selector = Web3.keccak(text=f"{fn_name}()")[:4]
             try:
                 raw = w3.eth.call({"to": reward_adapter, "data": selector})
                 if len(raw) == 32:
                     addr = "0x" + raw[-20:].hex()
                     print(f"  {fn_name}() -> {Web3.to_checksum_address(addr)}")
+            except Exception:
+                pass
+
+        # Try tokenId-parameterized candidates too — reward might be
+        # looked up per-position rather than fixed for the whole adapter.
+        from eth_abi import encode as abi_encode
+        encoded_tid = abi_encode(["uint256"], [tid])
+        for fn_name in ["getReward", "getRewards", "pendingReward", "pendingRewards",
+                         "earned", "claimable", "rewardOf", "pending"]:
+            selector = Web3.keccak(text=f"{fn_name}(uint256)")[:4]
+            try:
+                raw = w3.eth.call({"to": reward_adapter, "data": selector + encoded_tid})
+                print(f"  {fn_name}(tokenId={tid}) -> raw {len(raw)} bytes: {raw.hex()}")
             except Exception:
                 pass
