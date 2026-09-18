@@ -2,10 +2,10 @@
 Determine whether cumulativeFees0/1 is gross or net of Snuggle's 15%
 performance fee, by checking whether the treasury address actually
 receives a proportional token transfer at each rebalance (net
-accounting) or shows no such pattern (gross accounting, cut applied
-elsewhere e.g. at withdrawal).
+accounting) or shows no such pattern (gross accounting).
 """
 import os
+import requests
 from web3 import Web3
 import snuggle_adapter as sa
 
@@ -16,9 +16,7 @@ TREASURY = Web3.to_checksum_address("0x93d0D1216A613Ad8745f9320bCB25Dc04EA9EC12"
 VAULT_ADDRESS = sa.VAULT_ADDRESS
 MAXFI_VAULT_ADDRESS = sa.MAXFI_VAULT_ADDRESS
 
-TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)").hex()
-if not TRANSFER_TOPIC.startswith("0x"):
-    TRANSFER_TOPIC = "0x" + TRANSFER_TOPIC
+TRANSFER_TOPIC = "0x" + Web3.keccak(text="Transfer(address,address,uint256)").hex().lstrip("0x")
 
 ERC20_ABI = [{
     "inputs": [], "name": "decimals",
@@ -29,6 +27,25 @@ ERC20_ABI = [{
     "outputs": [{"internalType": "string", "name": "", "type": "string"}],
     "stateMutability": "view", "type": "function",
 }]
+
+
+def get_logs_raw(token_addr, from_block, to_block, to_topic):
+    """Raw JSON-RPC call with full error body visible, rather than
+    relying on web3.py's exception which was hiding the actual reason."""
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
+        "params": [{
+            "fromBlock": hex(from_block), "toBlock": hex(to_block),
+            "address": token_addr,
+            "topics": [TRANSFER_TOPIC, None, to_topic],
+        }],
+    }
+    resp = requests.post(BASE_RPC, json=payload, timeout=20)
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(f"RPC error: {data['error']}")
+    return data["result"]
+
 
 TEST_CASES = [
     ("maxfi", MAXFI_VAULT_ADDRESS, 6036685),
@@ -64,31 +81,25 @@ for label, vault_addr, token_id in TEST_CASES:
     print(f"token0={sym0} ({token0_addr}), token1={sym1} ({token1_addr})")
 
     if last_rebalance_time == 0:
-        print("Never rebalanced (last_rebalance_time=0) — skipping log search for this one.")
+        print("Never rebalanced — skipping.")
         continue
 
-    # ~2s block time on Base — estimate a block range spanning well
-    # before/after the last rebalance timestamp.
     seconds_ago = current_ts - last_rebalance_time
     est_block = current_block - int(seconds_ago / 2)
     from_block = max(0, est_block - 200)
     to_block = min(current_block, est_block + 200)
-    print(f"Searching blocks [{from_block}, {to_block}] (est. rebalance block ~{est_block}) for Transfer-to-treasury...")
+    print(f"Searching blocks [{from_block}, {to_block}] (est. rebalance block ~{est_block})...")
 
     to_topic = "0x" + "0" * 24 + TREASURY[2:].lower()
     for tok_addr, sym, dec in [(token0_addr, sym0, dec0), (token1_addr, sym1, dec1)]:
         try:
-            logs = w3.eth.get_logs({
-                "fromBlock": from_block, "toBlock": to_block,
-                "address": tok_addr,
-                "topics": [TRANSFER_TOPIC, None, to_topic],
-            })
+            logs = get_logs_raw(tok_addr, from_block, to_block, to_topic)
             if not logs:
-                print(f"  {sym}: no transfers to treasury found in this block window")
+                print(f"  {sym}: no transfers to treasury in this window")
             for log in logs:
-                raw_amount = int(log["data"].hex(), 16) if isinstance(log["data"], (bytes, bytearray)) else int(log["data"], 16)
+                raw_amount = int(log["data"], 16)
                 amount = raw_amount / (10 ** dec)
-                from_addr = "0x" + log["topics"][1].hex()[-40:]
-                print(f"  {sym}: block={log['blockNumber']} from={from_addr} amount={amount}")
+                from_addr = "0x" + log["topics"][1][-40:]
+                print(f"  {sym}: block={int(log['blockNumber'], 16)} from={from_addr} amount={amount}")
         except Exception as e:
-            print(f"  {sym}: log search failed: {e}")
+            print(f"  {sym}: FAILED: {e}")
