@@ -497,6 +497,173 @@ def _closed_positions_file_path(protocol: str) -> str:
     return os.path.join(HISTORY_DIR, f"closed_{protocol}.json")
 
 
+TRANSFER_TOPIC = "0x" + Web3.keccak(text="Transfer(address,address,uint256)").hex().lstrip("0x")
+CASHOUT_POLL_INTERVAL = 90  # seconds — matches Base's ~2s blocks comfortably
+CASHOUT_CHUNK_BLOCKS = 10  # Alchemy free-tier eth_getLogs cap, confirmed directly
+
+ERC20_MINI_ABI = [{
+    "inputs": [], "name": "decimals",
+    "outputs": [{"internalType": "uint8", "name": "", "type": "uint8"}],
+    "stateMutability": "view", "type": "function",
+}, {
+    "inputs": [], "name": "symbol",
+    "outputs": [{"internalType": "string", "name": "", "type": "string"}],
+    "stateMutability": "view", "type": "function",
+}]
+_token_meta_cache = {}
+
+
+def _token_meta_cached(w3, addr: str) -> tuple:
+    key = addr.lower()
+    if key not in _token_meta_cache:
+        c = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=ERC20_MINI_ABI)
+        _token_meta_cache[key] = (c.functions.symbol().call(), c.functions.decimals().call())
+    return _token_meta_cache[key]
+
+
+def _cashout_state_file_path() -> str:
+    return os.path.join(HISTORY_DIR, "cashout_state.json")
+
+
+def _cashout_log_file_path() -> str:
+    return os.path.join(HISTORY_DIR, "cashout_log.json")
+
+
+def _get_logs_raw(rpc_url: str, token_addr: str, from_block: int, to_block: int, from_topic: str, to_topic: str) -> list:
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
+        "params": [{
+            "fromBlock": hex(from_block), "toBlock": hex(to_block),
+            "address": token_addr, "topics": [TRANSFER_TOPIC, from_topic, to_topic],
+        }],
+    }
+    resp = requests.post(rpc_url, json=payload, timeout=20)
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(f"RPC error: {data['error']}")
+    return data["result"]
+
+
+def check_cashout_transfers():
+    """Detects auto-compound 'cash out' transfers landing directly in
+    the tracked wallets — Transfer events FROM a known vault TO the
+    position owner, for tokens involved in that owner's current
+    positions. Confirmed on-chain earlier that these land as direct
+    transfers in the same rebalance transaction, not a separate claim.
+
+    Chunks in CASHOUT_CHUNK_BLOCKS-block windows (Alchemy free-tier
+    eth_getLogs cap, hit directly and confirmed via the RPC's own
+    error message — not guessed). Starts tracking from whenever this
+    first runs, not retroactively (rebuilding history would need
+    tens of thousands of chunked calls per position, not practical
+    with this RPC tier)."""
+    w3 = get_w3()
+    if w3 is None:
+        return
+    rpc_url = ALCHEMY_BASE
+    current_block = w3.eth.block_number
+
+    state = _read_json_locked(_cashout_state_file_path(), {})
+    last_checked = state.get("last_checked_block")
+    if last_checked is None:
+        # First run ever — start from now, don't attempt to backfill.
+        _write_json_locked(_cashout_state_file_path(), {"last_checked_block": current_block})
+        return
+    if current_block <= last_checked:
+        return
+
+    cases = [
+        ("snuggle", DEFAULT_WALLET, VAULT_ADDRESS, VIEWHELPER_ADDRESS),
+        ("maxfi", DEFAULT_WALLET_MAXFI, MAXFI_VAULT_ADDRESS, MAXFI_VIEWHELPER_ADDRESS),
+    ]
+    new_entries = []
+    for protocol, wallet, vault_addr, view_helper_addr in cases:
+        if not wallet:
+            continue
+        try:
+            positions = fetch_snuggle_positions(wallet, w3, vault_addr, view_helper_addr)
+        except Exception as e:
+            app.logger.warning("Cashout check: position fetch failed for %s: %s", protocol, e)
+            continue
+
+        token_addrs = set()
+        for p in positions:
+            token_addrs.add(p["token0"]["address"])
+            token_addrs.add(p["token1"]["address"])
+
+        from_topic = "0x" + "0" * 24 + vault_addr[2:].lower()
+        to_topic = "0x" + "0" * 24 + wallet[2:].lower()
+
+        for token_addr in token_addrs:
+            b = last_checked + 1
+            while b <= current_block:
+                chunk_to = min(b + CASHOUT_CHUNK_BLOCKS - 1, current_block)
+                try:
+                    logs = _get_logs_raw(rpc_url, token_addr, b, chunk_to, from_topic, to_topic)
+                    for log in logs:
+                        sym, dec = _token_meta_cached(w3, token_addr)
+                        raw_amount = int(log["data"], 16)
+                        amount = raw_amount / (10 ** dec)
+                        new_entries.append({
+                            "protocol": protocol,
+                            "token_symbol": sym,
+                            "token_address": token_addr,
+                            "amount": amount,
+                            "tx_hash": log["transactionHash"],
+                            "block_number": int(log["blockNumber"], 16),
+                            "detected_at": time.time(),
+                        })
+                except Exception as e:
+                    app.logger.warning("Cashout check: log fetch failed for %s [%d,%d]: %s", token_addr, b, chunk_to, e)
+                b += CASHOUT_CHUNK_BLOCKS
+
+    if new_entries:
+        # Value in USD using current prices — a reasonable snapshot
+        # approximation since detection happens close to real-time.
+        addrs = list({e["token_address"] for e in new_entries})
+        prices = get_token_prices_usd(addrs)
+        for e in new_entries:
+            price = prices.get(e["token_address"].lower())
+            e["amount_usd"] = e["amount"] * price if price is not None else None
+
+        with _history_lock:
+            log = _read_json_locked(_cashout_log_file_path(), [])
+            log.extend(new_entries)
+            _write_json_locked_nolock(_cashout_log_file_path(), log)
+
+    _write_json_locked(_cashout_state_file_path(), {"last_checked_block": current_block})
+
+
+def _cashout_loop():
+    while True:
+        try:
+            check_cashout_transfers()
+        except Exception as e:
+            app.logger.error("Cashout loop error: %s", e)
+        time.sleep(CASHOUT_POLL_INTERVAL)
+
+
+_cashout_thread = threading.Thread(target=_cashout_loop, daemon=True)
+_cashout_thread.start()
+
+
+@app.route("/api/cashout-log")
+def api_cashout_log():
+    log = _read_json_locked(_cashout_log_file_path(), [])
+    total_usd = sum(e["amount_usd"] for e in log if e.get("amount_usd") is not None)
+    by_token = {}
+    for e in log:
+        key = e["token_symbol"]
+        by_token.setdefault(key, 0.0)
+        by_token[key] += e["amount"]
+    return jsonify({
+        "entries": log,
+        "entry_count": len(log),
+        "total_usd": total_usd if log else None,
+        "totals_by_token": by_token,
+    })
+
+
 def capture_snapshot(protocol_name: str, wallet: str, vault_address: str, view_helper_address: str):
     if not wallet:
         return
