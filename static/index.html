@@ -399,7 +399,7 @@ function renderPositions(el, positions, cfg, name) {
     const rangeClass = p.in_range ? 'in-range' : 'out-range';
     const badgeClass = p.in_range ? 'in' : 'out';
     const badgeText = p.in_range ? 'In Range' : 'Out of Range';
-    const oorDuration = fmtDuration(p.out_of_range_seconds);
+    const oorDuration = p.in_range ? null : fmtDuration(p.out_of_range_seconds);
     const posKey = `${name}-${p.token_id}`;
 
     const holdingsLine = (p.amount0 !== null && p.amount1 !== null)

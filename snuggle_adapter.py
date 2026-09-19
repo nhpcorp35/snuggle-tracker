@@ -216,16 +216,23 @@ def _token_decimals(w3, address: str) -> int:
     return dec
 
 
-def _get_sqrt_price_x96(w3, pool_addr: str) -> int:
-    """Try Uniswap-shaped slot0() first, fall back to PancakeSwap's
-    uint32-feeProtocol variant on decode failure."""
+def _get_pool_slot0(w3, pool_addr: str) -> tuple:
+    """Returns (sqrt_price_x96, current_tick). Try Uniswap-shaped
+    slot0() first, fall back to PancakeSwap's uint32-feeProtocol
+    variant on decode failure. Returns the exact on-chain tick
+    directly — not derived from sqrt_price via log math, which risks
+    off-by-one precision issues right at a range boundary (confirmed
+    this matters: found live positions sitting only ~24 ticks from
+    their edge)."""
     pool_addr = Web3.to_checksum_address(pool_addr)
     try:
         pool = w3.eth.contract(address=pool_addr, abi=UNISWAP_POOL_ABI)
-        return pool.functions.slot0().call()[0]
+        slot0 = pool.functions.slot0().call()
+        return slot0[0], slot0[1]
     except Exception:
         pool = w3.eth.contract(address=pool_addr, abi=PANCAKE_POOL_ABI)
-        return pool.functions.slot0().call()[0]
+        slot0 = pool.functions.slot0().call()
+        return slot0[0], slot0[1]
 
 
 def _tick_to_sqrt_price(tick: int) -> float:
@@ -308,6 +315,7 @@ def fetch_snuggle_positions(wallet: str, w3, vault_address: str = VAULT_ADDRESS,
         price_upper = None
         live_tick_lower = tick_lower
         live_tick_upper = tick_upper
+        live_current_tick = None
         try:
             adapter = w3.eth.contract(
                 address=Web3.to_checksum_address(position_adapter), abi=ADAPTER_ABI
@@ -315,7 +323,7 @@ def fetch_snuggle_positions(wallet: str, w3, vault_address: str = VAULT_ADDRESS,
             _t0a, _t1a, _feea, live_tick_lower, live_tick_upper, liquidity = (
                 adapter.functions.getPosition(token_id).call()
             )
-            sqrt_price_x96 = _get_sqrt_price_x96(w3, pool_addr)
+            sqrt_price_x96, live_current_tick = _get_pool_slot0(w3, pool_addr)
             sqrt_price = sqrt_price_x96 / (2 ** 96)
             sqrt_lower = _tick_to_sqrt_price(live_tick_lower)
             sqrt_upper = _tick_to_sqrt_price(live_tick_upper)
@@ -352,7 +360,20 @@ def fetch_snuggle_positions(wallet: str, w3, vault_address: str = VAULT_ADDRESS,
             except Exception:
                 pass  # leave reward fields as None rather than guess
 
-        in_range = out_of_range_since == 0
+        # Real bug found and fixed here: this used to be
+        # `out_of_range_since == 0` — the vault's own sticky flag,
+        # which only gets cleared when its keeper bot next checks in,
+        # not the instant price actually moves back into range.
+        # Confirmed directly on two live positions: real on-chain tick
+        # was inside the range while this flag still said "out" from
+        # hours earlier. Compute it live instead, from the exact
+        # on-chain tick — falls back to the vault's flag only if the
+        # live tick fetch itself failed (network hiccup), rather than
+        # silently trusting stale state as the default.
+        if live_current_tick is not None:
+            in_range = live_tick_lower <= live_current_tick < live_tick_upper
+        else:
+            in_range = out_of_range_since == 0
 
         results.append({
             "token_id": token_id,
