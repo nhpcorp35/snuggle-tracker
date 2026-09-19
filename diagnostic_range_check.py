@@ -25,6 +25,9 @@ for label, vault_addr in [("snuggle", sa.VAULT_ADDRESS), ("maxfi", sa.MAXFI_VAUL
         total_rebalances, last_rebalance_time, deposit_ts, cum_fees0,
         cum_fees1, cum_rewards, _reserved,
     ) = pos
+    if tick_lower == 0 and tick_upper == 0 and total_rebalances == 0 and deposit_ts == 0:
+        print(f"{label}: no real position for this token_id (empty struct returned, not reverted)")
+        continue
     print(f"\n{'='*60}\nFound on {label}: tick_lower={tick_lower}, tick_upper={tick_upper}")
     print(f"out_of_range_since={out_of_range_since}, total_rebalances={total_rebalances}")
 
