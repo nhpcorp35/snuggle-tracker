@@ -73,18 +73,20 @@
   .pos-title .id-tag { font-size: 11px; color: var(--muted); }
   .token-icons { display: flex; align-items: center; }
   .token-icons img, .token-icons .icon-fallback {
-    width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--surface);
+    width: 30px; height: 30px; border-radius: 50%; border: 2px solid var(--surface);
     display: block; object-fit: cover;
   }
-  .token-icons img:nth-child(2), .token-icons .icon-fallback:nth-child(2) { margin-left: -8px; }
+  .token-icons img:nth-child(2), .token-icons .icon-fallback:nth-child(2) { margin-left: -10px; }
   .icon-fallback {
-    background: var(--border2); color: var(--muted); font-size: 10px; font-weight: 600;
+    background: var(--border2); color: var(--muted); font-size: 13px; font-weight: 600;
     display: flex; align-items: center; justify-content: center; font-family: var(--mono);
   }
   .chain-badge {
-    font-size: 10px; color: var(--blue); background: var(--blue-dim);
-    padding: 2px 7px; border-radius: 4px; font-family: var(--mono);
+    display: flex; align-items: center; gap: 5px;
+    font-size: 11px; color: var(--blue); background: var(--blue-dim);
+    padding: 3px 9px 3px 5px; border-radius: 4px; font-family: var(--mono);
   }
+  .chain-badge img { width: 16px; height: 16px; border-radius: 50%; display: block; }
   .range-badge { font-family: var(--mono); font-size: 11px; font-weight: 600; padding: 4px 10px; border-radius: 6px; letter-spacing: 0.05em; }
   .range-badge.in { background: var(--green-dim); color: var(--green); }
   .range-badge.out { background: var(--amber-dim); color: var(--amber); }
@@ -339,6 +341,16 @@ function renderRangeBar(p) {
   `;
 }
 
+// Per-symbol overrides for tokens whose Base-chain entry doesn't
+// exist in Trustwallet's repo — confirmed directly which ones need
+// this before adding (UNI resolves under Ethereum mainnet's listing,
+// same artwork; cbBTC has no working entry anywhere in that repo, so
+// it stays on the letter-circle fallback).
+const TOKEN_ICON_OVERRIDES = {
+  UNI: 'https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/ethereum/assets/0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984/logo.png',
+};
+const BASE_CHAIN_ICON = 'https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/base/info/logo.png';
+
 function tokenIconFallback(imgEl, sym) {
   const div = document.createElement('div');
   div.className = 'icon-fallback';
@@ -348,17 +360,11 @@ function tokenIconFallback(imgEl, sym) {
 }
 
 function tokenIconHtml(token) {
-  // Trustwallet's public asset repo, keyed by checksummed contract
-  // address — confirmed directly which tokens resolve on Base before
-  // wiring this in (WETH/USDC/Cake do, UNI/cbBTC don't have a Base
-  // entry there yet). Falls back to a plain initial-letter circle via
-  // a real DOM-manipulating function on load failure — avoids nested
-  // quote-escaping bugs from embedding HTML markup inside an inline
-  // onerror string (caught this exact issue before deploying: the
-  // fallback's own double-quoted attributes collided with the outer
-  // onerror="..." attribute).
   const addr = token.address;
   const sym = token.symbol || '?';
+  if (TOKEN_ICON_OVERRIDES[sym]) {
+    return `<img src="${TOKEN_ICON_OVERRIDES[sym]}" alt="${sym}" title="${sym}" onerror="tokenIconFallback(this, '${sym}')">`;
+  }
   if (!addr) return `<div class="icon-fallback" title="${sym}">${sym.charAt(0)}</div>`;
   const url = `https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/base/assets/${addr}/logo.png`;
   return `<img src="${url}" alt="${sym}" title="${sym}" onerror="tokenIconFallback(this, '${sym}')">`;
@@ -470,7 +476,7 @@ function renderPositions(el, positions, cfg, name) {
             <div class="token-icons">${tokenIconHtml(p.token0)}${tokenIconHtml(p.token1)}</div>
             ${sym0} / ${sym1}
             <span class="fee-tag">${feeTierLabel(p.fee_tier)}</span>
-            <span class="chain-badge">Base</span>
+            <span class="chain-badge"><img src="${BASE_CHAIN_ICON}" alt="Base" onerror="this.remove()">Base</span>
             <span class="id-tag">#${p.token_id}</span>
           </div>
           <div style="text-align:right;">
