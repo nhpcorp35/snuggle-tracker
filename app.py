@@ -322,16 +322,6 @@ def api_maxfi_positions():
     return _handle_positions_request("maxfi", MAXFI_VAULT_ADDRESS, MAXFI_VIEWHELPER_ADDRESS, DEFAULT_WALLET_MAXFI)
 
 
-@app.route("/api/debug/wallets")
-def api_debug_wallets():
-    """Read-only — confirms the actual configured wallet addresses,
-    to rule out a wallet mismatch when a real deposit doesn't appear."""
-    return jsonify({
-        "DEFAULT_WALLET": DEFAULT_WALLET,
-        "DEFAULT_WALLET_MAXFI": DEFAULT_WALLET_MAXFI,
-    })
-
-
 @app.route("/api/health")
 def health():
     return jsonify({"ok": True, "rpc_configured": bool(ALCHEMY_BASE)})
