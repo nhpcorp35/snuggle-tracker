@@ -71,6 +71,20 @@
   .pos-title { font-family: var(--mono); font-size: 15px; font-weight: 500; color: var(--text); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .pos-title .fee-tag { font-size: 11px; color: var(--muted); background: var(--border); padding: 2px 8px; border-radius: 4px; }
   .pos-title .id-tag { font-size: 11px; color: var(--muted); }
+  .token-icons { display: flex; align-items: center; }
+  .token-icons img, .token-icons .icon-fallback {
+    width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--surface);
+    display: block; object-fit: cover;
+  }
+  .token-icons img:nth-child(2), .token-icons .icon-fallback:nth-child(2) { margin-left: -8px; }
+  .icon-fallback {
+    background: var(--border2); color: var(--muted); font-size: 10px; font-weight: 600;
+    display: flex; align-items: center; justify-content: center; font-family: var(--mono);
+  }
+  .chain-badge {
+    font-size: 10px; color: var(--blue); background: var(--blue-dim);
+    padding: 2px 7px; border-radius: 4px; font-family: var(--mono);
+  }
   .range-badge { font-family: var(--mono); font-size: 11px; font-weight: 600; padding: 4px 10px; border-radius: 6px; letter-spacing: 0.05em; }
   .range-badge.in { background: var(--green-dim); color: var(--green); }
   .range-badge.out { background: var(--amber-dim); color: var(--amber); }
@@ -325,11 +339,35 @@ function renderRangeBar(p) {
   `;
 }
 
+function tokenIconFallback(imgEl, sym) {
+  const div = document.createElement('div');
+  div.className = 'icon-fallback';
+  div.title = sym;
+  div.textContent = sym.charAt(0);
+  imgEl.replaceWith(div);
+}
+
+function tokenIconHtml(token) {
+  // Trustwallet's public asset repo, keyed by checksummed contract
+  // address — confirmed directly which tokens resolve on Base before
+  // wiring this in (WETH/USDC/Cake do, UNI/cbBTC don't have a Base
+  // entry there yet). Falls back to a plain initial-letter circle via
+  // a real DOM-manipulating function on load failure — avoids nested
+  // quote-escaping bugs from embedding HTML markup inside an inline
+  // onerror string (caught this exact issue before deploying: the
+  // fallback's own double-quoted attributes collided with the outer
+  // onerror="..." attribute).
+  const addr = token.address;
+  const sym = token.symbol || '?';
+  if (!addr) return `<div class="icon-fallback" title="${sym}">${sym.charAt(0)}</div>`;
+  const url = `https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/base/assets/${addr}/logo.png`;
+  return `<img src="${url}" alt="${sym}" title="${sym}" onerror="tokenIconFallback(this, '${sym}')">`;
+}
+
 function fmtPnl(usd, pct) {
   if (usd === null || usd === undefined) return null;
   const cls = usd >= 0 ? 'pnl-pos' : 'pnl-neg';
-  const sign = usd >= 0 ? '+' : '-';
-  const usdStr = sign + '$' + Math.abs(usd).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const sign = usd >= 0 ? '+' : '-';  const usdStr = sign + '$' + Math.abs(usd).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const pctStr = (pct !== null && pct !== undefined)
     ? ` (${sign}${Math.abs(pct).toFixed(2)}%)` : '';
   return { cls, text: usdStr + pctStr };
@@ -429,8 +467,10 @@ function renderPositions(el, positions, cfg, name) {
       <div class="position-card ${rangeClass}">
         <div class="pos-header">
           <div class="pos-title">
+            <div class="token-icons">${tokenIconHtml(p.token0)}${tokenIconHtml(p.token1)}</div>
             ${sym0} / ${sym1}
             <span class="fee-tag">${feeTierLabel(p.fee_tier)}</span>
+            <span class="chain-badge">Base</span>
             <span class="id-tag">#${p.token_id}</span>
           </div>
           <div style="text-align:right;">
