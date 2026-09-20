@@ -76,17 +76,14 @@
     width: 30px; height: 30px; border-radius: 50%; border: 2px solid var(--surface);
     display: block; object-fit: cover;
   }
-  .token-icons img:nth-child(2), .token-icons .icon-fallback:nth-child(2) { margin-left: -10px; }
+  .token-icons img + img, .token-icons img + .icon-fallback,
+  .token-icons .icon-fallback + img, .token-icons .icon-fallback + .icon-fallback {
+    margin-left: -10px;
+  }
   .icon-fallback {
     background: var(--border2); color: var(--muted); font-size: 13px; font-weight: 600;
     display: flex; align-items: center; justify-content: center; font-family: var(--mono);
   }
-  .chain-badge {
-    display: flex; align-items: center; gap: 5px;
-    font-size: 11px; color: var(--blue); background: var(--blue-dim);
-    padding: 3px 9px 3px 5px; border-radius: 4px; font-family: var(--mono);
-  }
-  .chain-badge img { width: 16px; height: 16px; border-radius: 50%; display: block; }
   .range-badge { font-family: var(--mono); font-size: 11px; font-weight: 600; padding: 4px 10px; border-radius: 6px; letter-spacing: 0.05em; }
   .range-badge.in { background: var(--green-dim); color: var(--green); }
   .range-badge.out { background: var(--amber-dim); color: var(--amber); }
@@ -473,10 +470,9 @@ function renderPositions(el, positions, cfg, name) {
       <div class="position-card ${rangeClass}">
         <div class="pos-header">
           <div class="pos-title">
-            <div class="token-icons">${tokenIconHtml(p.token0)}${tokenIconHtml(p.token1)}</div>
+            <div class="token-icons">${tokenIconHtml(p.token0)}${tokenIconHtml(p.token1)}<img src="${BASE_CHAIN_ICON}" alt="Base" title="Base" onerror="tokenIconFallback(this, 'Base')"></div>
             ${sym0} / ${sym1}
             <span class="fee-tag">${feeTierLabel(p.fee_tier)}</span>
-            <span class="chain-badge"><img src="${BASE_CHAIN_ICON}" alt="Base" onerror="this.remove()">Base</span>
             <span class="id-tag">#${p.token_id}</span>
           </div>
           <div style="text-align:right;">
