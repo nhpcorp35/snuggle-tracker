@@ -263,6 +263,49 @@ def _get_pool_config(vault, vault_address: str, pool_id: bytes) -> tuple:
     return cfg
 
 
+
+# ── Uncollected fees ─────────────────────────────────────────────────
+# The vault's cumulativeFees counter only includes fees it has already
+# collected (at compound/rebalance). Verified on #6078482: counter $0.13
+# vs $3.78 still sitting uncollected in the NFT. A static NPM.collect()
+# call from the NFT's owner (vault, or MasterChef when staked) returns
+# everything collectable now — the NPM pokes the pool first, so accrued
+# fees are included. eth_call only; nothing is sent.
+NPMS = [
+    Web3.to_checksum_address("0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1"),  # Uniswap V3 (Base)
+    Web3.to_checksum_address("0x46A15B0b27311cedF172AB29E4f4766fbE7F4364"),  # PancakeSwap V3 (Base)
+]
+NPM_ABI = [
+    {"name": "ownerOf", "type": "function", "stateMutability": "view",
+     "inputs": [{"name": "tokenId", "type": "uint256"}], "outputs": [{"name": "", "type": "address"}]},
+    {"name": "collect", "type": "function", "stateMutability": "payable",
+     "inputs": [{"name": "params", "type": "tuple", "components": [
+         {"name": "tokenId", "type": "uint256"}, {"name": "recipient", "type": "address"},
+         {"name": "amount0Max", "type": "uint128"}, {"name": "amount1Max", "type": "uint128"}]}],
+     "outputs": [{"name": "amount0", "type": "uint256"}, {"name": "amount1", "type": "uint256"}]},
+]
+_MAX128 = 2 ** 128 - 1
+_npm_for_token = {}  # token_id -> NPM address (stable; saves an ownerOf probe per fetch)
+
+
+def _uncollected_fees_raw(w3, token_id):
+    """Returns (amount0_raw, amount1_raw) or None if it can't be determined."""
+    candidates = [_npm_for_token[token_id]] if token_id in _npm_for_token else NPMS
+    for npm_addr in candidates:
+        npm = w3.eth.contract(address=npm_addr, abi=NPM_ABI)
+        try:
+            owner = npm.functions.ownerOf(token_id).call()
+        except Exception:
+            continue
+        try:
+            a0, a1 = npm.functions.collect((token_id, owner, _MAX128, _MAX128)).call({"from": owner})
+        except Exception:
+            return None
+        _npm_for_token[token_id] = npm_addr
+        return a0, a1
+    return None
+
+
 def fetch_snuggle_positions(wallet: str, w3, vault_address: str = VAULT_ADDRESS,
                              view_helper_address: str = VIEWHELPER_ADDRESS) -> list:
     """
@@ -305,8 +348,16 @@ def fetch_snuggle_positions(wallet: str, w3, vault_address: str = VAULT_ADDRESS,
         dec0 = _token_decimals(w3, token0_addr)
         dec1 = _token_decimals(w3, token1_addr)
 
-        cum_fees0_readable = cum_fees0 / (10 ** dec0)
-        cum_fees1_readable = cum_fees1 / (10 ** dec1)
+        collected0 = cum_fees0 / (10 ** dec0)
+        collected1 = cum_fees1 / (10 ** dec1)
+        uncollected0 = uncollected1 = None
+        raw = _uncollected_fees_raw(w3, token_id)
+        if raw is not None:
+            uncollected0 = raw[0] / (10 ** dec0)
+            uncollected1 = raw[1] / (10 ** dec1)
+        # Lifetime fees = collected (vault counter) + still uncollected
+        cum_fees0_readable = collected0 + (uncollected0 or 0.0)
+        cum_fees1_readable = collected1 + (uncollected1 or 0.0)
 
         amount0 = None
         amount1 = None
@@ -389,6 +440,10 @@ def fetch_snuggle_positions(wallet: str, w3, vault_address: str = VAULT_ADDRESS,
             "auto_compound": auto_compound,
             "cumulative_fees0": cum_fees0_readable,
             "cumulative_fees1": cum_fees1_readable,
+            "collected_fees0": collected0,
+            "collected_fees1": collected1,
+            "uncollected_fees0": uncollected0,
+            "uncollected_fees1": uncollected1,
             "cumulative_rewards_raw": cum_rewards,
             "is_staked": reward_adapter != "0x0000000000000000000000000000000000000000",
             "reward_token_address": reward_token_address,
