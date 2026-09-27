@@ -26,28 +26,42 @@ NPM_ABI = [
 ERC20 = [{"name": "decimals", "type": "function", "stateMutability": "view", "inputs": [], "outputs": [{"name": "", "type": "uint8"}]},
          {"name": "symbol", "type": "function", "stateMutability": "view", "inputs": [], "outputs": [{"name": "", "type": "string"}]}]
 
-for label, vault_addr in [("snuggle", sa.VAULT_ADDRESS), ("maxfi", sa.MAXFI_VAULT_ADDRESS)]:
-    vault = w3.eth.contract(address=vault_addr, abi=sa.VAULT_ABI)
-    pos = vault.functions.positions(TOKEN_ID).call()
-    (_tid, pool_id, owner, _w, tl, tu, _as, _ac, _rd, _oor, rebal, last_rebal, dep_ts, cf0, cf1, _cr, _r) = pos
-    if tl == 0 and tu == 0 and rebal == 0 and dep_ts == 0:
-        continue
-    cfg = sa._get_pool_config(vault, vault_addr, pool_id)
-    t0, t1 = cfg[1], cfg[2]
-    d0 = w3.eth.contract(address=t0, abi=ERC20).functions.decimals().call()
-    d1 = w3.eth.contract(address=t1, abi=ERC20).functions.decimals().call()
-    s0 = w3.eth.contract(address=t0, abi=ERC20).functions.symbol().call()
-    s1 = w3.eth.contract(address=t1, abi=ERC20).functions.symbol().call()
-    print(f"Vault={label} rebalances={rebal} last_rebalance_ts={last_rebal} deposit_ts={dep_ts}")
-    print(f"Vault cumulativeFees: {cf0 / 10**d0:.8f} {s0} + {cf1 / 10**d1:.6f} {s1}")
+import time
 
-    for dex, npm_addr in NPMS.items():
-        npm = w3.eth.contract(address=Web3.to_checksum_address(npm_addr), abi=NPM_ABI)
-        try:
-            nft_owner = npm.functions.ownerOf(TOKEN_ID).call()
-        except Exception:
+def run():
+    for label, vault_addr in [("snuggle", sa.VAULT_ADDRESS), ("maxfi", sa.MAXFI_VAULT_ADDRESS)]:
+        vault = w3.eth.contract(address=vault_addr, abi=sa.VAULT_ABI)
+        pos = vault.functions.positions(TOKEN_ID).call()
+        (_tid, pool_id, owner, _w, tl, tu, _as, _ac, _rd, _oor, rebal, last_rebal, dep_ts, cf0, cf1, _cr, _r) = pos
+        if tl == 0 and tu == 0 and rebal == 0 and dep_ts == 0:
             continue
-        print(f"NFT on {dex}, owner={nft_owner}")
-        a0, a1 = npm.functions.collect((TOKEN_ID, nft_owner, MAX128, MAX128)).call({"from": nft_owner})
-        print(f"Collectable now (uncollected fees): {a0 / 10**d0:.8f} {s0} + {a1 / 10**d1:.6f} {s1}")
+        cfg = sa._get_pool_config(vault, vault_addr, pool_id)
+        t0, t1 = cfg[1], cfg[2]
+        d0 = w3.eth.contract(address=t0, abi=ERC20).functions.decimals().call()
+        d1 = w3.eth.contract(address=t1, abi=ERC20).functions.decimals().call()
+        s0 = w3.eth.contract(address=t0, abi=ERC20).functions.symbol().call()
+        s1 = w3.eth.contract(address=t1, abi=ERC20).functions.symbol().call()
+        print(f"Vault={label} rebalances={rebal} last_rebalance_ts={last_rebal} deposit_ts={dep_ts}")
+        print(f"Vault cumulativeFees: {cf0 / 10**d0:.8f} {s0} + {cf1 / 10**d1:.6f} {s1}")
+
+        for dex, npm_addr in NPMS.items():
+            npm = w3.eth.contract(address=Web3.to_checksum_address(npm_addr), abi=NPM_ABI)
+            try:
+                nft_owner = npm.functions.ownerOf(TOKEN_ID).call()
+            except Exception:
+                continue
+            print(f"NFT on {dex}, owner={nft_owner}")
+            a0, a1 = npm.functions.collect((TOKEN_ID, nft_owner, MAX128, MAX128)).call({"from": nft_owner})
+            print(f"Collectable now (uncollected fees): {a0 / 10**d0:.8f} {s0} + {a1 / 10**d1:.6f} {s1}")
+
+for attempt in range(6):
+    try:
+        run()
+        break
+    except Exception as e:
+        if "429" not in str(e):
+            raise
+        wait = 30 * (attempt + 1)
+        print(f"429 from RPC, retrying in {wait}s (attempt {attempt + 1}/6)", flush=True)
+        time.sleep(wait)
 print("DONE")
