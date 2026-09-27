@@ -445,6 +445,8 @@ def fetch_snuggle_positions(wallet: str, w3, vault_address: str = VAULT_ADDRESS,
             "uncollected_fees0": uncollected0,
             "uncollected_fees1": uncollected1,
             "cumulative_rewards_raw": cum_rewards,
+            "cum_fees0_raw": cum_fees0,
+            "cum_fees1_raw": cum_fees1,
             "is_staked": reward_adapter != "0x0000000000000000000000000000000000000000",
             "reward_token_address": reward_token_address,
             "reward_token_symbol": reward_token_symbol,
@@ -461,3 +463,75 @@ def fetch_snuggle_positions(wallet: str, w3, vault_address: str = VAULT_ADDRESS,
         })
 
     return results
+
+
+# ── Historical holdings (for "vs hold") ───────────────────────────────
+# Reads a position's full state at a past block via archive eth_calls:
+# liquidity amounts + tokens owed (uncollected fees), plus the vault's
+# collected-fee and reward counters, so the tracker can compare the LP
+# against simply holding the starting tokens. One-time per position;
+# callers cache the result.
+
+def _slot0_at(w3, pool_addr, block):
+    pool_addr = Web3.to_checksum_address(pool_addr)
+    for abi in (UNISWAP_POOL_ABI, PANCAKE_POOL_ABI):
+        try:
+            s0 = w3.eth.contract(address=pool_addr, abi=abi).functions.slot0().call(block_identifier=block)
+            return s0[0], s0[1]
+        except Exception:
+            continue
+    raise RuntimeError(f"slot0 failed for {pool_addr} at {block}")
+
+
+def block_for_timestamp(w3, ts: float) -> int:
+    """Base produces a block every 2s; estimate then correct once."""
+    head = w3.eth.get_block("latest")
+    n = int(head["number"] - (head["timestamp"] - ts) / 2)
+    for _ in range(2):
+        b = w3.eth.get_block(n)
+        diff = b["timestamp"] - ts
+        if abs(diff) <= 2:
+            break
+        n -= int(diff / 2)
+    return n
+
+
+def holdings_at_block(w3, vault_address: str, token_id: int, block: int) -> dict:
+    """Raw token amounts (liquidity + uncollected) and vault counters at `block`."""
+    vault = w3.eth.contract(address=vault_address, abi=VAULT_ABI)
+    pos = vault.functions.positions(token_id).call(block_identifier=block)
+    pool_id, cum_fees0, cum_fees1, cum_rewards = pos[1], pos[13], pos[14], pos[15]
+    cfg = _get_pool_config(vault, vault_address, pool_id)
+    pool_addr, _t0, _t1, _fee, _ts, _active, position_adapter, reward_adapter = cfg
+    adapter = w3.eth.contract(address=Web3.to_checksum_address(position_adapter), abi=ADAPTER_ABI)
+    _a, _b, _c, tick_lower, tick_upper, liquidity = adapter.functions.getPosition(token_id).call(block_identifier=block)
+    sqrt_price_x96, _tick = _slot0_at(w3, pool_addr, block)
+    a0, a1 = _amounts_for_liquidity(sqrt_price_x96 / (2 ** 96), _tick_to_sqrt_price(tick_lower),
+                                    _tick_to_sqrt_price(tick_upper), liquidity)
+    owed0 = owed1 = 0
+    for npm_addr in NPMS:
+        npm = w3.eth.contract(address=npm_addr, abi=NPM_ABI)
+        try:
+            owner = npm.functions.ownerOf(token_id).call(block_identifier=block)
+        except Exception:
+            continue
+        owed0, owed1 = npm.functions.collect((token_id, owner, _MAX128, _MAX128)).call(
+            {"from": owner}, block_identifier=block)
+        break
+    pending_reward = 0
+    if reward_adapter != "0x0000000000000000000000000000000000000000":
+        try:
+            rc = w3.eth.contract(address=Web3.to_checksum_address(reward_adapter), abi=REWARD_ADAPTER_ABI)
+            pending_reward = rc.functions.pendingRewards(token_id).call(block_identifier=block)
+        except Exception:
+            pending_reward = 0
+    return {
+        "block": block,
+        "amount0_raw": int(a0) + int(owed0),
+        "amount1_raw": int(a1) + int(owed1),
+        "cum_fees0_raw": int(cum_fees0),
+        "cum_fees1_raw": int(cum_fees1),
+        "cum_rewards_raw": int(cum_rewards),
+        "pending_reward_raw": int(pending_reward),
+        "liquidity": int(liquidity),
+    }

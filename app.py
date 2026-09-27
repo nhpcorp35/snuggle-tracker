@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 
 from snuggle_adapter import (
     fetch_snuggle_positions,
+    block_for_timestamp,
+    holdings_at_block,
     VAULT_ADDRESS, VIEWHELPER_ADDRESS,
     MAXFI_VAULT_ADDRESS, MAXFI_VIEWHELPER_ADDRESS,
 )
@@ -152,6 +154,8 @@ def enrich_with_usd_and_apr(positions: list) -> list:
 
         price0 = prices.get(p["token0"]["address"].lower())
         price1 = prices.get(p["token1"]["address"].lower())
+        p["price0_usd"], p["price1_usd"] = price0, price1
+        p["reward_price_usd"] = prices.get(p["reward_token_address"].lower()) if p.get("reward_token_address") else None
 
         position_value_usd = None
         if p["amount0"] is not None and p["amount1"] is not None and price0 is not None and price1 is not None:
@@ -225,6 +229,83 @@ def attach_pnl(positions: list, protocol_name: str) -> list:
     return positions
 
 
+def _hold_baseline_file_path(protocol: str) -> str:
+    return os.path.join(HISTORY_DIR, f"hold_baseline_{protocol}.json")
+
+
+def attach_vs_hold(positions: list, protocol_name: str) -> list:
+    """LP vs simply holding the starting tokens, over the same window as
+    P&L (baseline_ts -> now), everything valued at TODAY's prices so
+    price moves cancel out and only LP performance remains.
+
+      hold  = tokens at baseline (liquidity + uncollected) x prices now
+      lp    = tokens now (liquidity + uncollected) x prices now
+              + fees collected in window if NOT auto-compounding
+                (compounded fees are already inside the liquidity)
+              + reward tokens earned in window (staked positions)
+      vs_hold = lp - hold
+
+    Baseline holdings come from archive reads (compute_hold_baselines),
+    cached per position. None until computed — never estimated."""
+    baselines = _read_json_locked(_hold_baseline_file_path(protocol_name), {})
+    for p in positions:
+        p["hold_value_usd"] = p["lp_value_usd"] = p["vs_hold_usd"] = p["vs_hold_pct"] = None
+        p["vs_hold_flag"] = None
+        b = baselines.get(str(p["token_id"]))
+        pr0, pr1 = p.get("price0_usd"), p.get("price1_usd")
+        if not b or b.get("error") or pr0 is None or pr1 is None or p["amount0"] is None:
+            continue
+        d0, d1 = p["token0"]["decimals"], p["token1"]["decimals"]
+        hold = (b["amount0_raw"] / 10 ** d0) * pr0 + (b["amount1_raw"] / 10 ** d1) * pr1
+        now0 = p["amount0"] + (p.get("uncollected_fees0") or 0.0)
+        now1 = p["amount1"] + (p.get("uncollected_fees1") or 0.0)
+        if not p.get("auto_compound"):
+            now0 += max(p["cum_fees0_raw"] - b["cum_fees0_raw"], 0) / 10 ** d0
+            now1 += max(p["cum_fees1_raw"] - b["cum_fees1_raw"], 0) / 10 ** d1
+        lp = now0 * pr0 + now1 * pr1
+        rp = p.get("reward_price_usd")
+        if p.get("is_staked") and rp is not None:
+            earned_raw = (int(p["cumulative_rewards_raw"]) - b["cum_rewards_raw"]) - b["pending_reward_raw"]
+            reward_now = p.get("pending_reward") or 0.0
+            lp += (earned_raw / 1e18 + reward_now) * rp
+        p["hold_value_usd"] = hold
+        p["lp_value_usd"] = lp
+        p["vs_hold_usd"] = lp - hold
+        p["vs_hold_pct"] = (lp - hold) / hold * 100.0 if hold > 0 else None
+        # A top-up mid-window would show up as a big "gain" vs hold
+        if hold > 0 and lp / hold > 1.25:
+            p["vs_hold_flag"] = "possible deposit during window"
+    return positions
+
+
+def compute_hold_baselines(protocol_name: str, vault_address: str, max_per_cycle: int = 3):
+    """Fill in missing baseline holdings via archive reads at each
+    position's P&L baseline time. One-time per position."""
+    w3 = get_w3()
+    if not w3:
+        return
+    known = _read_json_locked(_known_positions_file_path(protocol_name), {})
+    path = _hold_baseline_file_path(protocol_name)
+    baselines = _read_json_locked(path, {})
+    done = 0
+    for tid, entry in known.items():
+        if tid in baselines or not entry.get("baseline_ts") or done >= max_per_cycle:
+            continue
+        try:
+            block = block_for_timestamp(w3, entry["baseline_ts"])
+            h = holdings_at_block(w3, vault_address, int(tid), block)
+            h["baseline_ts"] = entry["baseline_ts"]
+            baselines[tid] = h
+            app.logger.info("vs-hold baseline %s #%s at block %s", protocol_name, tid, block)
+        except Exception as e:
+            app.logger.warning("vs-hold baseline failed %s #%s: %s", protocol_name, tid, e)
+            if "429" in str(e):
+                break  # rate limit: retry next cycle
+            baselines[tid] = {"error": str(e)[:200], "baseline_ts": entry["baseline_ts"]}
+        done += 1
+    _write_json_locked(path, baselines)
+
+
 def compute_portfolio_summary(positions: list) -> dict:
     """Aggregate totals across all positions. Value-weighted average
     APR (weighted by each position's USD value) rather than a naive
@@ -257,7 +338,18 @@ def compute_portfolio_summary(positions: list) -> dict:
         "out_of_range_count": sum(1 for p in positions if not p["in_range"]),
         "total_pnl_usd": total_pnl_usd,
         "total_pnl_pct": total_pnl_pct,
+        **_vs_hold_totals(positions),
     }
+
+
+def _vs_hold_totals(positions: list) -> dict:
+    vh = [p for p in positions if p.get("vs_hold_usd") is not None]
+    if not vh:
+        return {"total_vs_hold_usd": None, "total_vs_hold_pct": None, "vs_hold_positions": 0}
+    total = sum(p["vs_hold_usd"] for p in vh)
+    hold = sum(p["hold_value_usd"] for p in vh)
+    return {"total_vs_hold_usd": total, "total_vs_hold_pct": total / hold * 100.0 if hold > 0 else None,
+            "vs_hold_positions": len(vh)}
 
 
 @app.route("/")
@@ -291,6 +383,7 @@ def _handle_positions_request(cache_prefix: str, vault_address: str, view_helper
         positions = fetch_snuggle_positions(wallet, w3, vault_address, view_helper_address)
         positions = enrich_with_usd_and_apr(positions)
         positions = attach_pnl(positions, cache_prefix)
+        positions = attach_vs_hold(positions, cache_prefix)
     except Exception as e:
         app.logger.error("%s fetch failed for %s: %s", cache_prefix, wallet, e)
         stale = _stale_cache.get(cache_key)
@@ -772,6 +865,11 @@ def capture_snapshot(protocol_name: str, wallet: str, vault_address: str, view_h
                 "baseline_ts": baseline_ts,
             }
         _write_json_locked_nolock(known_path, new_known)
+
+    try:
+        compute_hold_baselines(protocol_name, vault_address)
+    except Exception as e:
+        app.logger.warning("vs-hold baseline pass failed (%s): %s", protocol_name, e)
 
 
 def _append_to_list_at_path(path: str, item: dict):

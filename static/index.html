@@ -397,6 +397,10 @@ function renderPortfolio(el, portfolio) {
   const pnlBlock = pnl
     ? `<div class="portfolio-stat-value ${pnl.cls}">${pnl.text}</div>`
     : `<div class="portfolio-stat-value dim">—</div>`;
+  const vh = fmtPnl(portfolio.total_vs_hold_usd, portfolio.total_vs_hold_pct);
+  const vhBlock = vh
+    ? `<div class="portfolio-stat-value ${vh.cls}">${vh.text}</div><div class="stat-value dim" style="font-size:10px;margin-top:2px;">${portfolio.vs_hold_positions} of ${portfolio.position_count} positions</div>`
+    : `<div class="portfolio-stat-value dim">calculating…</div>`;
 
   el.innerHTML = `
     <div class="portfolio-bar">
@@ -411,6 +415,10 @@ function renderPortfolio(el, portfolio) {
       <div>
         <div class="portfolio-stat-label">Total P&L (since tracked)</div>
         ${pnlBlock}
+      </div>
+      <div>
+        <div class="portfolio-stat-label">LP vs Hold (since tracked)</div>
+        ${vhBlock}
       </div>
       <div>
         <div class="portfolio-stat-label">Blended Avg APR</div>
@@ -455,6 +463,10 @@ function renderPositions(el, positions, cfg, name) {
     const pnlLine = pnl
       ? `<div class="pnl-sub ${pnl.cls}">${pnl.text}</div>`
       : '';
+    const vhp = fmtPnl(p.vs_hold_usd, p.vs_hold_pct);
+    const vsHoldLine = vhp
+      ? `<div class="pnl-sub ${vhp.cls}" title="LP now vs holding the starting tokens, both at today's prices">vs hold ${vhp.text}${p.vs_hold_flag ? ' ⚠ ' + p.vs_hold_flag : ''}</div>`
+      : '';
 
     const aprLine = fmtPct(p.lifetime_apr_pct, 1);
     const feesUsd = fmtUsd(p.cumulative_fees_usd);
@@ -489,6 +501,7 @@ function renderPositions(el, positions, cfg, name) {
             <div class="stat-value">${holdingsLine}</div>
             ${usdLine}
             ${pnlLine}
+            ${vsHoldLine}
           </div>
           <div>
             <div class="stat-label">Range Width</div>
